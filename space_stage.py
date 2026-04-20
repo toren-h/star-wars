@@ -277,6 +277,7 @@ def space_stage():
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_c:     display.toggle_slow()
                 if e.key == pygame.K_SPACE: xwing.shoot(bullets)
+                if e.key == pygame.K_f:     return "landed_destroyer"
 
         keys = pygame.key.get_pressed()
         if STATE == "combat":

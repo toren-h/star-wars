@@ -399,11 +399,13 @@ def parkour_stage(which_map="old"):
     player  = Player(*START_POS)
     camx = camy = 0.0
     win  = False
+    saber_len    = float(C.SABER_LEN)
+    saber_target = float(C.SABER_LEN)
     _request_restart_flag[0] = False
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -413,6 +415,7 @@ def parkour_stage(which_map="old"):
         player = Player(*START); player.deaths = deaths
         turrets = [Turret(r, c) for (r, c) in sp]; bolts = []
         camx = camy = 0.0; win = False
+        saber_len = saber_target = float(C.SABER_LEN)
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
 
@@ -428,6 +431,8 @@ def parkour_stage(which_map="old"):
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_c:   display.toggle_slow()
                 if e.key in (pygame.K_w, pygame.K_UP): player.jump()
+                if e.key == pygame.K_e:
+                    saber_target = 0.0 if saber_target > 0 else float(C.SABER_LEN)
                 if e.key == pygame.K_x:   force_push(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_v:   force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_r:
@@ -438,6 +443,12 @@ def parkour_stage(which_map="old"):
         keys = pygame.key.get_pressed()
         player.update(keys, dt, ROWS, COLS, get_tile)
 
+        step = 2.5 * display.TIME_SCALE
+        if saber_len < saber_target:
+            saber_len = min(saber_len + step, saber_target)
+        elif saber_len > saber_target:
+            saber_len = max(saber_len - step, saber_target)
+
         mx, my   = pygame.mouse.get_pos()
         mxw, myw = mx + camx, my + camy
         pcx, pcy = player.rect.centerx, player.rect.centery
@@ -445,17 +456,20 @@ def parkour_stage(which_map="old"):
         d        = max(1.0, math.hypot(dx, dy))
         ux, uy   = dx / d, dy / d
         saber_p1 = (pcx, pcy)
-        saber_p2 = (pcx + ux * C.SABER_LEN, pcy + uy * C.SABER_LEN)
+        saber_p2 = (pcx + ux * saber_len, pcy + uy * saber_len)
 
         for s in siths[:]:
             s.update(player)
-            if seg_intersects_rect(saber_p1, saber_p2, s.rect):
+            if (seg_intersects_rect(saber_p1, saber_p2, s.rect) or
+                    seg_intersect(saber_p1, saber_p2, s.p1, s.p2) or
+                    s.check_hit(player)):
                 siths.remove(s); continue
-            if seg_intersect(saber_p1, saber_p2, s.p1, s.p2):
-                continue
-            if s.check_hit(player):
-                _request_restart_flag[0] = True; _death_pending_flag[0] = True; break
 
+        for t in turrets[:]:
+            if seg_intersects_rect(saber_p1, saber_p2, t.rect):
+                if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
+                    set_tile(t.r, t.c, '.')
+                turrets.remove(t)
         for t in turrets[:]: t.check_support_and_maybe_fall(ROWS, COLS, get_tile)
         for t in turrets[:]:
             if t.update_fall(ROWS, COLS, get_tile, set_tile): turrets.remove(t)
@@ -510,7 +524,7 @@ def parkour_stage(which_map="old"):
         display.screen.blit(display.FONT.render(
             f"Time: {t:05.2f}s   Speed x{display.TIME_SCALE:.2f} (C toggles)", True, C.WHITE), (10, 30))
         display.screen.blit(display.FONT.render(
-            "Move A/D or L/R  Jump W/Up  Saber:mouse LMB reflect/RMB destroy  Push X  Pull V  R restart",
+            "Move A/D or L/R  Jump W/Up  Saber:mouse LMB reflect/RMB destroy  E toggle saber  Push X  Pull V  R restart",
             True, C.YELLOW), (10, C.HEIGHT - 28))
         if win:
             msg = display.BIG.render("You cleared the stronghold!", True, C.WHITE)
