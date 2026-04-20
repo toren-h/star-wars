@@ -1,0 +1,54 @@
+WIDTH, HEIGHT = 960, 600
+TILE = 40
+
+TIME_SLOW = 0.45
+
+WHITE  = (240, 240, 240)
+BLACK  = (10, 10, 12)
+GREY   = (65, 68, 73)
+BLUE   = (80, 135, 255)
+RED    = (230, 70, 70)
+YELLOW = (250, 220, 80)
+CYAN   = (120, 220, 255)
+GREEN  = (40, 180, 120)
+
+# Space stage
+SPACE_SHIP_W          = 46
+SPACE_SHIP_H          = 24
+ROT_SPEED             = 0.06
+THRUST                = 0.45
+SPACE_DRAG            = 0.988
+SPACE_MAXSPEED        = 6.0
+LASER_SPEED           = 14.0
+LASER_CD_MS           = 180
+TIE_SPAWN_MS          = 1000
+TIE_MIN_SPEED         = 2.0
+TIE_MAX_SPEED         = 3.2
+TIE_LASER_SPEED       = 7.0
+TIE_SHOOT_CD_MS       = 900
+STAR_COUNT            = 160
+KILLS_TO_SPAWN_DESTROYER = 1
+SHUTDOWN_HITS         = 10
+FALL_THRUST           = 0.12
+FALL_ROT              = 0.03
+PLANET_RADIUS         = 240
+PLANET_PULL           = 0.00045
+PLANET_EDGE_OFFSET    = 1600
+ATMOSPHERE_PAD        = 20
+
+# Parkour stage
+GRAVITY               = 0.55
+FRICTION              = 0.85
+MAX_XSPEED            = 6.2
+JUMP_SPEED            = 10.3
+BOLT_SPEED            = 7.2
+FIRE_RADIUS_TILES     = 10
+BASE_TURRET_COOLDOWN_MS = 500
+TURRET_FALL_KILL_TILES = 4
+SABER_LEN             = 74
+SABER_THICKNESS       = 8
+FORCE_RADIUS_TILES    = 10
+FORCE_RADIUS_PX       = FORCE_RADIUS_TILES * TILE
+FORCE_BLOCKED_TILES   = {'X', 'B', 'G'}
+FORCE_TURRET_STEPS    = 3
+FORCE_BOLT_IMPULSE    = 6.0
