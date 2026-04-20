@@ -1,4 +1,4 @@
-import pygame, sys, math
+import pygame, sys, math, random
 import constants as C
 import display
 
@@ -112,6 +112,20 @@ def seg_intersects_rect(p1, p2, rect):
             seg_intersect(p1, p2, (x2, y2), (x3, y3)) or
             seg_intersect(p1, p2, (x3, y3), (x4, y4)) or
             seg_intersect(p1, p2, (x4, y4), (x1, y1)))
+
+# ---- Lightning ----
+def _make_lightning(p1, p2, segments=10, jitter=14):
+    pts = [p1]
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    length = max(1, math.hypot(dx, dy))
+    px, py = -dy / length, dx / length
+    for i in range(1, segments):
+        t = i / segments
+        mx = p1[0] + dx * t + px * random.uniform(-jitter, jitter)
+        my = p1[1] + dy * t + py * random.uniform(-jitter, jitter)
+        pts.append((mx, my))
+    pts.append(p2)
+    return pts
 
 # ---- Force powers ----
 def _within_force_line(px, py, x, y):
@@ -354,14 +368,14 @@ def draw_bolts(bolts, camx, camy):
         color = C.YELLOW if b.friendly else C.RED
         pygame.draw.circle(display.screen, color, (int(b.x - camx), int(b.y - camy)), b.r)
 
-def draw_player(p, camx, camy, p1, p2):
+def draw_player(p, camx, camy, p1, p2, saber_color=C.CYAN):
     x, y = p.rect.x - camx, p.rect.y - camy
     pygame.draw.rect(display.screen,  C.BLUE,         (x, y, p.w, p.h), border_radius=5)
     pygame.draw.rect(display.screen,  (230, 230, 255), (x + 6, y + 4, p.w - 12, 8), border_radius=3)
-    pygame.draw.line(display.screen,  C.CYAN,
+    pygame.draw.line(display.screen,  saber_color,
                      (int(p1[0] - camx), int(p1[1] - camy)),
                      (int(p2[0] - camx), int(p2[1] - camy)), C.SABER_THICKNESS)
-    pygame.draw.circle(display.screen, C.CYAN,
+    pygame.draw.circle(display.screen, saber_color,
                        (int(p.rect.centerx - camx), int(p.rect.centery - camy)), 3)
 
 def center_camera_on_player(camx, camy, p, ROWS, COLS):
@@ -399,13 +413,16 @@ def parkour_stage(which_map="old"):
     player  = Player(*START_POS)
     camx = camy = 0.0
     win  = False
-    saber_len    = float(C.SABER_LEN)
-    saber_target = float(C.SABER_LEN)
+    saber_len       = float(C.SABER_LEN)
+    saber_target    = float(C.SABER_LEN)
+    saber_color     = C.CYAN
+    saber_switching = False
+    lightnings      = []  # list of (world_points, expire_ms)
     _request_restart_flag[0] = False
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -415,7 +432,7 @@ def parkour_stage(which_map="old"):
         player = Player(*START); player.deaths = deaths
         turrets = [Turret(r, c) for (r, c) in sp]; bolts = []
         camx = camy = 0.0; win = False
-        saber_len = saber_target = float(C.SABER_LEN)
+        saber_len = saber_target = float(C.SABER_LEN); saber_color = C.CYAN; saber_switching = False; lightnings = []
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
 
@@ -436,6 +453,23 @@ def parkour_stage(which_map="old"):
                 if e.key == pygame.K_x:   force_push(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_v:   force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_r:
+                    saber_switching = True
+                    saber_target = 0.0
+                if e.key == pygame.K_t and saber_color == C.RED:
+                    mx, my = pygame.mouse.get_pos()
+                    lp1 = (float(player.rect.centerx), float(player.rect.centery))
+                    lp2 = (mx + camx, my + camy)
+                    lightnings.append((_make_lightning(lp1, lp2),
+                                       pygame.time.get_ticks() + 400))
+                    for s in siths[:]:
+                        if seg_intersects_rect(lp1, lp2, s.rect):
+                            siths.remove(s)
+                    for t in turrets[:]:
+                        if seg_intersects_rect(lp1, lp2, t.rect):
+                            if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
+                                set_tile(t.r, t.c, '.')
+                            turrets.remove(t)
+                if e.key == pygame.K_BACKSPACE:
                     _request_restart_flag[0] = True; _death_pending_flag[0] = False
                 if e.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
@@ -443,11 +477,27 @@ def parkour_stage(which_map="old"):
         keys = pygame.key.get_pressed()
         player.update(keys, dt, ROWS, COLS, get_tile)
 
+        if saber_color == C.RED:
+            mx, my = pygame.mouse.get_pos()
+            tc = int(mx + camx) // C.TILE
+            tr = int(my + camy) // C.TILE
+            if keys[pygame.K_q] and get_tile(tr, tc) == '.':
+                set_tile(tr, tc, 'X')
+            if keys[pygame.K_l] and get_tile(tr, tc) == 'X':
+                set_tile(tr, tc, '.')
+                for t in turrets:
+                    if not t.falling and t.r == tr - 1 and t.c == tc:
+                        t.start_fall(ROWS, COLS, get_tile, set_tile)
+
         step = 2.5 * display.TIME_SCALE
         if saber_len < saber_target:
             saber_len = min(saber_len + step, saber_target)
         elif saber_len > saber_target:
             saber_len = max(saber_len - step, saber_target)
+        if saber_switching and saber_len == 0.0:
+            saber_color = C.RED if saber_color == C.CYAN else C.CYAN
+            saber_target = float(C.SABER_LEN)
+            saber_switching = False
 
         mx, my   = pygame.mouse.get_pos()
         mxw, myw = mx + camx, my + camy
@@ -516,15 +566,24 @@ def parkour_stage(which_map="old"):
         draw_level(level_grid, ROWS, COLS, camx, camy)
         draw_falling_turrets(turrets, camx, camy)
         draw_bolts(bolts, camx, camy)
-        draw_player(player, camx, camy, saber_p1, saber_p2)
+        draw_player(player, camx, camy, saber_p1, saber_p2, saber_color)
         for s in siths: s.draw(display.screen, camx, camy)
+
+        now = pygame.time.get_ticks()
+        lightnings = [l for l in lightnings if l[1] > now]
+        for pts, expire in lightnings:
+            for i in range(len(pts) - 1):
+                p1s = (int(pts[i][0]   - camx), int(pts[i][1]   - camy))
+                p2s = (int(pts[i+1][0] - camx), int(pts[i+1][1] - camy))
+                pygame.draw.line(display.screen, (180, 180, 255), p1s, p2s, 3)
+                pygame.draw.line(display.screen, (255, 255, 255), p1s, p2s, 1)
 
         t = player.time_ms / 1000.0
         display.screen.blit(display.FONT.render(f"Deaths: {player.deaths}", True, C.WHITE), (10, 10))
         display.screen.blit(display.FONT.render(
             f"Time: {t:05.2f}s   Speed x{display.TIME_SCALE:.2f} (C toggles)", True, C.WHITE), (10, 30))
         display.screen.blit(display.FONT.render(
-            "Move A/D or L/R  Jump W/Up  Saber:mouse LMB reflect/RMB destroy  E toggle saber  Push X  Pull V  R restart",
+            "Move A/D or L/R  Jump W/Up  Saber:mouse LMB/RMB  E toggle saber  R saber colour  Q place block (red)  Push X  Pull V  Backspace restart",
             True, C.YELLOW), (10, C.HEIGHT - 28))
         if win:
             msg = display.BIG.render("You cleared the stronghold!", True, C.WHITE)
