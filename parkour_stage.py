@@ -173,36 +173,112 @@ def force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile):
 
 # ---- Entities ----
 class SithLord:
+    MAX_HP          = 3
+    APPROACH_SPEED  = 1.8
+    STRIKE_RANGE_PX = 90
+    WINDUP_MS       = 600
+    STRIKE_MS       = 300
+    RECOVER_MS      = 700
+    STAGGER_MS      = 500
+    HIT_IFRAMES_MS  = 400
+
     def __init__(self, x, y):
         self.w, self.h = 26, 34
-        self.rect      = pygame.Rect(x + 7, y + 6, self.w, self.h)
+        self.rect = pygame.Rect(x + 7, y + 6, self.w, self.h)
+        self.hp = self.MAX_HP
+        self.state = 'approach'
+        self.state_start = pygame.time.get_ticks()
+        self.face_dir = 1
+        self.flash_until = 0
+        self.invincible_until = 0
+        self.p1 = (float(self.rect.centerx), float(self.rect.centery))
+        self.p2 = self.p1
+
+    def take_hit(self):
+        now = pygame.time.get_ticks()
+        if now < self.invincible_until:
+            return False
+        self.hp -= 1
+        self.flash_until = now + 200
+        self.invincible_until = now + self.HIT_IFRAMES_MS
+        self.state = 'stagger'
+        self.state_start = now
+        return self.hp <= 0
+
+    def stagger(self):
+        now = pygame.time.get_ticks()
+        self.state = 'stagger'
+        self.state_start = now
+        self.flash_until = now + 150
 
     def update(self, player):
-        px, py = player.rect.center
-        sx, sy = self.rect.center
-        dx, dy = px - sx, py - sy
-        d      = max(1, math.hypot(dx, dy))
-        self.ux, self.uy = dx / d, dy / d
-        t      = pygame.time.get_ticks() * 0.01
-        angle  = math.atan2(self.uy, self.ux) + math.sin(t) * 0.3
-        self.wx, self.wy = math.cos(angle), math.sin(angle)
-        self.p1 = (sx, sy)
-        self.p2 = (sx + self.wx * C.SABER_LEN, sy + self.wy * C.SABER_LEN)
+        now = pygame.time.get_ticks()
+        ts  = display.TIME_SCALE
+        sx, sy = float(self.rect.centerx), float(self.rect.centery)
+        px     = float(player.rect.centerx)
+        dx     = px - sx
+        dist   = abs(dx)
+        self.face_dir = 1 if dx >= 0 else -1
+        elapsed = now - self.state_start
 
-    def check_hit(self, player):
+        if self.state == 'approach':
+            if dist > self.STRIKE_RANGE_PX:
+                move = min(self.APPROACH_SPEED * ts, dist - self.STRIKE_RANGE_PX)
+                self.rect.x += int(self.face_dir * max(1, move))
+            else:
+                self.state = 'windup'; self.state_start = now
+        elif self.state == 'windup':
+            if elapsed >= int(self.WINDUP_MS / max(ts, 0.1)):
+                self.state = 'strike'; self.state_start = now
+        elif self.state == 'strike':
+            if elapsed >= int(self.STRIKE_MS / max(ts, 0.1)):
+                self.state = 'recover'; self.state_start = now
+        elif self.state == 'recover':
+            if elapsed >= int(self.RECOVER_MS / max(ts, 0.1)):
+                self.state = 'approach'; self.state_start = now
+        elif self.state == 'stagger':
+            if elapsed >= int(self.STAGGER_MS / max(ts, 0.1)):
+                self.state = 'approach'; self.state_start = now
+
+        sx, sy = float(self.rect.centerx), float(self.rect.centery)
+        t = now * 0.001
+        if self.state == 'windup':
+            angle = math.atan2(-0.8, -self.face_dir)
+        elif self.state == 'strike':
+            progress  = min((now - self.state_start) / max(self.STRIKE_MS, 1), 1.0)
+            start_a   = math.atan2(-0.8, -self.face_dir)
+            end_a     = math.atan2(0.3,   self.face_dir)
+            angle     = start_a + (end_a - start_a) * progress
+        elif self.state == 'stagger':
+            angle = math.atan2(1.0, -self.face_dir)
+        else:
+            angle = math.atan2(-0.2, self.face_dir) + math.sin(t * 2) * 0.25
+        self.p1 = (sx, sy)
+        self.p2 = (sx + math.cos(angle) * C.SABER_LEN, sy + math.sin(angle) * C.SABER_LEN)
+
+    def check_hit_on_player(self, player):
+        if self.state != 'strike':
+            return False
         if self.rect.colliderect(player.rect):
             return True
         px, py = player.rect.center
         return point_seg_dist_sq(px, py, *self.p1, *self.p2) < (C.SABER_THICKNESS + 4) ** 2
 
     def draw(self, screen, camx, camy):
+        now  = pygame.time.get_ticks()
         x, y = self.rect.x - camx, self.rect.y - camy
-        pygame.draw.rect(screen, C.RED, (x, y, self.w, self.h), border_radius=5)
+        body_col  = (255, 255, 255) if now < self.flash_until else C.RED
+        pygame.draw.rect(screen, body_col, (x, y, self.w, self.h), border_radius=5)
         pygame.draw.rect(screen, (255, 150, 150), (x + 6, y + 4, self.w - 12, 8), border_radius=3)
-        pygame.draw.line(screen, C.RED,
+        saber_col = (255, 100, 100) if self.state == 'windup' else C.RED
+        pygame.draw.line(screen, saber_col,
                          (int(self.p1[0] - camx), int(self.p1[1] - camy)),
                          (int(self.p2[0] - camx), int(self.p2[1] - camy)),
                          C.SABER_THICKNESS)
+        bar_w = max(0, int(self.w * self.hp / self.MAX_HP))
+        bar_x, bar_y = int(x), int(y) - 8
+        pygame.draw.rect(screen, (80, 0, 0),    (bar_x, bar_y, self.w, 5))
+        pygame.draw.rect(screen, (220, 50, 50), (bar_x, bar_y, bar_w, 5))
 
 
 class Player:
@@ -311,6 +387,40 @@ class Turret:
             bolts.append(Bolt(spawn_x, spawn_y, ux * C.BOLT_SPEED, uy * C.BOLT_SPEED))
 
 
+class Grenade:
+    SPEED      = 10.0
+    FUSE_MS    = 2500
+    EXP_RADIUS = 100  # 2.5 tiles
+
+    def __init__(self, x, y, vx, vy):
+        self.x, self.y   = float(x), float(y)
+        self.vx, self.vy = float(vx), float(vy)
+        self.alive = True
+        self.born  = pygame.time.get_ticks()
+
+    def rect(self):
+        return pygame.Rect(int(self.x) - 4, int(self.y) - 4, 8, 8)
+
+    def update(self, ROWS, COLS, get_tile):
+        if not self.alive: return False
+        ts = display.TIME_SCALE
+        self.vy = min(self.vy + C.GRAVITY * ts, 16)
+        self.x += self.vx * ts
+        self.y += self.vy * ts
+        for (_, _, ch) in tiles_at(self.rect(), ROWS, COLS, get_tile):
+            if ch == 'X':
+                self.alive = False; return True
+        if pygame.time.get_ticks() - self.born >= self.FUSE_MS:
+            self.alive = False; return True
+        return False
+
+    def draw(self, camx, camy):
+        t = (pygame.time.get_ticks() - self.born) / self.FUSE_MS
+        color = (255, int(200 - 150 * t), 50) if t < 0.7 else (255, 50, 50)
+        pygame.draw.circle(display.screen, color,
+                           (int(self.x - camx), int(self.y - camy)), 5)
+
+
 class Bolt:
     def __init__(self, x, y, vx, vy):
         self.x  = float(x); self.y  = float(y)
@@ -368,9 +478,10 @@ def draw_bolts(bolts, camx, camy):
         color = C.YELLOW if b.friendly else C.RED
         pygame.draw.circle(display.screen, color, (int(b.x - camx), int(b.y - camy)), b.r)
 
-def draw_player(p, camx, camy, p1, p2, saber_color=C.CYAN):
+def draw_player(p, camx, camy, p1, p2, saber_color=C.CYAN, flash=False):
     x, y = p.rect.x - camx, p.rect.y - camy
-    pygame.draw.rect(display.screen,  C.BLUE,         (x, y, p.w, p.h), border_radius=5)
+    body_col = (255, 255, 255) if flash else C.BLUE
+    pygame.draw.rect(display.screen,  body_col,       (x, y, p.w, p.h), border_radius=5)
     pygame.draw.rect(display.screen,  (230, 230, 255), (x + 6, y + 4, p.w - 12, 8), border_radius=3)
     pygame.draw.line(display.screen,  saber_color,
                      (int(p1[0] - camx), int(p1[1] - camy)),
@@ -418,11 +529,21 @@ def parkour_stage(which_map="old"):
     saber_color     = C.CYAN
     saber_switching = False
     lightnings      = []  # list of (world_points, expire_ms)
+    grenades             = []
+    explosions           = []  # list of (wx, wy, start_ms, sparks)
+    crumbling_effects    = []  # list of (wx, wy, start_ms, pieces)
+    grenade_charge_start = None
+    last_lightning_t     = 0
+    float_accum          = 0.0
+    nuke_state           = None  # None | ('fuse', start_ms, x, y) | ('blast', start_ms, sparks)
+    player_hp            = 3
+    player_flash_until   = 0
+    red_seq              = []   # tracks progress through R-E-D combo
     _request_restart_flag[0] = False
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings, grenades, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -432,7 +553,9 @@ def parkour_stage(which_map="old"):
         player = Player(*START); player.deaths = deaths
         turrets = [Turret(r, c) for (r, c) in sp]; bolts = []
         camx = camy = 0.0; win = False
-        saber_len = saber_target = float(C.SABER_LEN); saber_color = C.CYAN; saber_switching = False; lightnings = []
+        saber_len = saber_target = float(C.SABER_LEN); saber_color = C.CYAN; saber_switching = False
+        lightnings = []; grenades = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
+        player_hp = 3; player_flash_until = 0; red_seq.clear()
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
 
@@ -452,30 +575,99 @@ def parkour_stage(which_map="old"):
                     saber_target = 0.0 if saber_target > 0 else float(C.SABER_LEN)
                 if e.key == pygame.K_x:   force_push(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_v:   force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
+                # R-E-D sequence activates color switch
+                _RED_KEYS = [pygame.K_r, pygame.K_e, pygame.K_d]
+                _RED_TIMEOUT = 10000
                 if e.key == pygame.K_r:
-                    saber_switching = True
-                    saber_target = 0.0
-                if e.key == pygame.K_t and saber_color == C.RED:
-                    mx, my = pygame.mouse.get_pos()
-                    lp1 = (float(player.rect.centerx), float(player.rect.centery))
-                    lp2 = (mx + camx, my + camy)
-                    lightnings.append((_make_lightning(lp1, lp2),
-                                       pygame.time.get_ticks() + 400))
-                    for s in siths[:]:
-                        if seg_intersects_rect(lp1, lp2, s.rect):
-                            siths.remove(s)
-                    for t in turrets[:]:
-                        if seg_intersects_rect(lp1, lp2, t.rect):
-                            if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
-                                set_tile(t.r, t.c, '.')
-                            turrets.remove(t)
+                    red_seq.clear()
+                    red_seq.append((pygame.K_r, pygame.time.get_ticks()))
+                elif e.key == pygame.K_e and red_seq and red_seq[-1][0] == pygame.K_r:
+                    if pygame.time.get_ticks() - red_seq[0][1] <= _RED_TIMEOUT:
+                        red_seq.append((pygame.K_e, pygame.time.get_ticks()))
+                elif e.key == pygame.K_d and len(red_seq) == 2 and red_seq[-1][0] == pygame.K_e:
+                    if pygame.time.get_ticks() - red_seq[0][1] <= _RED_TIMEOUT:
+                        saber_switching = True
+                        saber_target = 0.0
+                    red_seq.clear()
+                if e.key == pygame.K_z and nuke_state is None and saber_color == C.RED:
+                    nuke_state = ('phone', pygame.time.get_ticks(), float(player.rect.centerx))
+                if e.key == pygame.K_g and saber_color == C.RED:
+                    grenade_charge_start = pygame.time.get_ticks()
                 if e.key == pygame.K_BACKSPACE:
                     _request_restart_flag[0] = True; _death_pending_flag[0] = False
                 if e.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
+            elif e.type == pygame.KEYUP:
+                if e.key == pygame.K_g and grenade_charge_start is not None:
+                    hold_ms = pygame.time.get_ticks() - grenade_charge_start
+                    # scale speed: min 4, max ~20 (≈10 blocks horizontal range)
+                    speed = 4.0 + 16.0 * min(hold_ms / 1500.0, 1.0)
+                    mx, my = pygame.mouse.get_pos()
+                    tx, ty = mx + camx, my + camy
+                    pcx, pcy = float(player.rect.centerx), float(player.rect.centery)
+                    dx, dy = tx - pcx, ty - pcy
+                    d = max(1.0, math.hypot(dx, dy))
+                    grenades.append(Grenade(pcx, pcy, dx / d * speed, dy / d * speed))
+                    grenade_charge_start = None
 
         keys = pygame.key.get_pressed()
+        ts   = display.TIME_SCALE
+        floating_now = keys[pygame.K_f] and saber_color == C.RED
+        if not floating_now:
+            float_accum = 0.0
+        else:
+            # pre-cancel gravity so player.update() produces zero net downward movement
+            player.vy = -C.GRAVITY * ts
         player.update(keys, dt, ROWS, COLS, get_tile)
+
+        if floating_now:
+            float_accum += dt * ts * (C.TILE * 1.5 / 1000.0)
+            rise = int(float_accum)
+            float_accum -= rise
+            player.rect.y -= rise
+            for (r, c, ch) in tiles_at(player.rect, ROWS, COLS, get_tile):
+                if ch == 'X':
+                    t = rect_for_tile(r, c)
+                    if player.rect.colliderect(t):
+                        player.rect.top = t.bottom
+                        float_accum = 0.0
+                        break
+            player.vy = 0
+            pcx = float(player.rect.centerx)
+            feet_y = float(player.rect.bottom)
+            col = player.rect.centerx // C.TILE
+            ground_y = float(ROWS * C.TILE)
+            for r in range(player.rect.bottom // C.TILE, ROWS):
+                if get_tile(r, col) == 'X':
+                    ground_y = float(r * C.TILE); break
+            lp1 = (pcx, feet_y)
+            lp2 = (pcx, ground_y)
+            lightnings.append((_make_lightning(lp1, lp2, segments=6, jitter=8),
+                               pygame.time.get_ticks() + int(80 / max(ts, 0.1))))
+            for s in siths[:]:
+                if seg_intersects_rect(lp1, lp2, s.rect):
+                    siths.remove(s)
+            for t in turrets[:]:
+                if seg_intersects_rect(lp1, lp2, t.rect):
+                    if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
+                        set_tile(t.r, t.c, '.')
+                    turrets.remove(t)
+
+        now_t = pygame.time.get_ticks()
+        if keys[pygame.K_t] and saber_color == C.RED and now_t - last_lightning_t >= int(80 / max(ts, 0.1)):
+            last_lightning_t = now_t
+            mx, my = pygame.mouse.get_pos()
+            lp1 = (float(player.rect.centerx), float(player.rect.centery))
+            lp2 = (mx + camx, my + camy)
+            lightnings.append((_make_lightning(lp1, lp2), now_t + int(120 / max(ts, 0.1))))
+            for s in siths[:]:
+                if seg_intersects_rect(lp1, lp2, s.rect):
+                    siths.remove(s)
+            for t in turrets[:]:
+                if seg_intersects_rect(lp1, lp2, t.rect):
+                    if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
+                        set_tile(t.r, t.c, '.')
+                    turrets.remove(t)
 
         if saber_color == C.RED:
             mx, my = pygame.mouse.get_pos()
@@ -510,10 +702,22 @@ def parkour_stage(which_map="old"):
 
         for s in siths[:]:
             s.update(player)
-            if (seg_intersects_rect(saber_p1, saber_p2, s.rect) or
-                    seg_intersect(saber_p1, saber_p2, s.p1, s.p2) or
-                    s.check_hit(player)):
-                siths.remove(s); continue
+            sabers_clash        = seg_intersect(saber_p1, saber_p2, s.p1, s.p2)
+            player_hits_body    = seg_intersects_rect(saber_p1, saber_p2, s.rect)
+
+            if sabers_clash and s.state in ('windup', 'strike'):
+                s.stagger()
+            elif player_hits_body:
+                if s.take_hit():
+                    siths.remove(s); continue
+
+            if s in siths and s.check_hit_on_player(player):
+                player_hp -= 1
+                player_flash_until = pygame.time.get_ticks() + 350
+                s.state = 'recover'; s.state_start = pygame.time.get_ticks()
+                player.vx = s.face_dir * 4.0
+                if player_hp <= 0:
+                    _request_restart_flag[0] = True; _death_pending_flag[0] = True
 
         for t in turrets[:]:
             if seg_intersects_rect(saber_p1, saber_p2, t.rect):
@@ -526,6 +730,104 @@ def parkour_stage(which_map="old"):
         for t in turrets[:]: t.update_and_maybe_shoot(player, bolts, ROWS, COLS, get_tile)
         for b in bolts:
             if b.alive: b.update(ROWS, COLS, get_tile)
+
+        def do_explode(gx, gy):
+            sparks = []
+            for _ in range(20):
+                angle = random.uniform(0, 2 * math.pi)
+                speed = random.uniform(2.0, 7.0)
+                sparks.append((math.cos(angle) * speed, math.sin(angle) * speed,
+                               random.choice([(255,220,80),(255,140,0),(255,60,0),(255,255,180)])))
+            explosions.append((gx, gy, pygame.time.get_ticks(), sparks))
+            r = Grenade.EXP_RADIUS
+            for row in range(ROWS):
+                for col in range(COLS):
+                    tx = col * C.TILE + C.TILE // 2
+                    ty = row * C.TILE + C.TILE // 2
+                    if math.hypot(tx - gx, ty - gy) <= r and get_tile(row, col) in ('B', 'X'):
+                        set_tile(row, col, '.')
+                        pieces = []
+                        for _ in range(6):
+                            a = random.uniform(0, 2 * math.pi)
+                            sp = random.uniform(1.5, 4.0)
+                            pieces.append((math.cos(a)*sp, math.sin(a)*sp, random.randint(4,10)))
+                        crumbling_effects.append((float(tx), float(ty), pygame.time.get_ticks(), pieces))
+            for s in siths[:]:
+                if math.hypot(s.rect.centerx - gx, s.rect.centery - gy) <= r:
+                    siths.remove(s)
+            for t in turrets[:]:
+                if math.hypot(t.rect.centerx - gx, t.rect.centery - gy) <= r:
+                    if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
+                        set_tile(t.r, t.c, '.')
+                    turrets.remove(t)
+            if math.hypot(player.rect.centerx - gx, player.rect.centery - gy) <= r:
+                _request_restart_flag[0] = True; _death_pending_flag[0] = True
+
+        for g in grenades[:]:
+            detonated = g.update(ROWS, COLS, get_tile)
+            if not detonated:
+                for s in siths:
+                    if g.rect().colliderect(s.rect):
+                        detonated = True; break
+            if not detonated:
+                for t in turrets:
+                    if g.rect().colliderect(t.rect):
+                        detonated = True; break
+            if detonated:
+                do_explode(g.x, g.y)
+                grenades.remove(g)
+
+        explosions        = [e for e in explosions        if pygame.time.get_ticks() - e[2] < 700]
+        crumbling_effects = [e for e in crumbling_effects if pygame.time.get_ticks() - e[2] < 450]
+
+        def _trigger_nuke_blast(nx, ny):
+            for row in range(ROWS):
+                for col in range(COLS):
+                    if get_tile(row, col) in ('X', 'B', '^'):
+                        set_tile(row, col, '.')
+                        if random.random() < 0.3:
+                            tx = col * C.TILE + C.TILE // 2
+                            ty = row * C.TILE + C.TILE // 2
+                            pieces = [(math.cos(a := random.uniform(0,2*math.pi))*random.uniform(2,6),
+                                       math.sin(a)*random.uniform(2,6),
+                                       random.randint(4,10)) for _ in range(5)]
+                            crumbling_effects.append((float(tx), float(ty), pygame.time.get_ticks(), pieces))
+            siths.clear()
+            turrets.clear()
+            bolts.clear()
+            grenades.clear()
+            crumbling_effects.clear()
+            explosions.clear()
+            sparks = []
+            for _ in range(60):
+                a  = random.uniform(0, 2*math.pi)
+                sp = random.uniform(3.0, 18.0)
+                sparks.append((math.cos(a)*sp, math.sin(a)*sp,
+                               random.choice([(255,220,80),(255,140,0),(255,60,0),(255,255,180),(255,255,255)])))
+            return ('blast', pygame.time.get_ticks(), nx, ny, sparks)
+
+        if nuke_state is not None:
+            if nuke_state[0] == 'phone':
+                _, phone_start, spawn_x = nuke_state
+                if pygame.time.get_ticks() - phone_start >= 10000:
+                    nuke_state = ('falling', spawn_x, -80.0, 0.0)
+            elif nuke_state[0] == 'falling':
+                _, nx, ny, vy = nuke_state
+                vy  = min(vy + C.GRAVITY * display.TIME_SCALE * 2.5, 24.0)
+                ny += vy * display.TIME_SCALE
+                nuke_rect = pygame.Rect(int(nx)-20, int(ny)-20, 40, 40)
+                hit = ny >= ROWS * C.TILE
+                for (_, _, ch) in tiles_at(nuke_rect, ROWS, COLS, get_tile):
+                    if ch == 'X': hit = True; break
+                if hit:
+                    nuke_state = _trigger_nuke_blast(nx, ny)
+                else:
+                    nuke_state = ('falling', nx, ny, vy)
+            elif nuke_state[0] == 'blast':
+                _, blast_start, nx, ny, _ = nuke_state
+                if pygame.time.get_ticks() - blast_start >= 2000:
+                    _request_restart_flag[0] = True; _death_pending_flag[0] = True
+                    nuke_state = None
 
         camx, camy = center_camera_on_player(camx, camy, player, ROWS, COLS)
 
@@ -566,8 +868,114 @@ def parkour_stage(which_map="old"):
         draw_level(level_grid, ROWS, COLS, camx, camy)
         draw_falling_turrets(turrets, camx, camy)
         draw_bolts(bolts, camx, camy)
-        draw_player(player, camx, camy, saber_p1, saber_p2, saber_color)
+        draw_player(player, camx, camy, saber_p1, saber_p2, saber_color,
+                    flash=pygame.time.get_ticks() < player_flash_until)
         for s in siths: s.draw(display.screen, camx, camy)
+        for g in grenades: g.draw(camx, camy)
+        if grenade_charge_start is not None:
+            charge = min((pygame.time.get_ticks() - grenade_charge_start) / 1500.0, 1.0)
+            bx = int(player.rect.centerx - camx) - 20
+            by = int(player.rect.top - camy) - 12
+            pygame.draw.rect(display.screen, (80, 80, 80),   (bx, by, 40, 6))
+            pygame.draw.rect(display.screen, (255, 140, 0),  (bx, by, int(40 * charge), 6))
+        for ex, ey, start, sparks in explosions:
+            age  = pygame.time.get_ticks() - start
+            t    = age / 700.0          # 0→1 over lifetime
+            fade = max(0, 1.0 - t)
+            sx, sy = int(ex - camx), int(ey - camy)
+
+            # central flash (bright white → yellow, shrinks fast)
+            flash_r = int(Grenade.EXP_RADIUS * 0.5 * max(0, 1 - age / 120))
+            if flash_r > 0:
+                pygame.draw.circle(display.screen, (255, 255, 220), (sx, sy), flash_r)
+
+            # slow outer ring (orange → red, expands to full radius)
+            r1 = int(Grenade.EXP_RADIUS * min(t * 1.4, 1.0))
+            if r1 > 0:
+                c1 = (255, int(120 * fade), 0)
+                pygame.draw.circle(display.screen, c1, (sx, sy), r1, 3)
+
+            # fast inner ring (yellow, expands to 60% radius quickly)
+            r2 = int(Grenade.EXP_RADIUS * 0.6 * min(t * 2.5, 1.0))
+            if r2 > 0:
+                c2 = (255, int(220 * fade), int(80 * fade))
+                pygame.draw.circle(display.screen, c2, (sx, sy), r2, 2)
+
+            # spark particles
+            age_s = age / 60.0  # convert ms→ approx frames at ~60fps scaled
+            for vx, vy, color in sparks:
+                px = int(ex + vx * age_s - camx)
+                py = int(ey + vy * age_s + 0.3 * age_s * age_s - camy)
+                size = max(1, int(4 * fade))
+                fc   = (int(color[0] * fade), int(color[1] * fade), int(color[2] * fade))
+                pygame.draw.circle(display.screen, fc, (px, py), size)
+
+        for bx, by, start, pieces in crumbling_effects:
+            age  = pygame.time.get_ticks() - start
+            t    = age / 450.0
+            fade = max(0.0, 1.0 - t)
+            age_s = age / 60.0
+            for vx, vy, size in pieces:
+                px = int(bx + vx * age_s - camx)
+                py = int(by + vy * age_s + 0.25 * age_s * age_s - camy)
+                s  = max(1, int(size * fade))
+                g  = int(68 * fade)
+                pygame.draw.rect(display.screen, (g+10, g+10, g+15), (px - s//2, py - s//2, s, s))
+
+        if nuke_state is not None:
+            if nuke_state[0] == 'phone':
+                _, phone_start, _ = nuke_state
+                remaining = max(0, 10 - (pygame.time.get_ticks() - phone_start) / 1000.0)
+                # small phone in player's left hand
+                hx = int(player.rect.left  - 12 - camx)
+                hy = int(player.rect.centery + 2 - camy)
+                pw, ph = 12, 20
+                pygame.draw.rect(display.screen, (30, 30, 35),    (hx, hy, pw, ph), border_radius=3)
+                pygame.draw.rect(display.screen, (160, 160, 190), (hx, hy, pw, ph), 1, border_radius=3)
+                pygame.draw.rect(display.screen, (10, 20, 80),    (hx+2, hy+3, pw-4, ph-8), border_radius=1)
+                # pulsing red dot (call indicator)
+                pulse_r = 2 + int(abs(math.sin(pygame.time.get_ticks() * 0.01)))
+                pygame.draw.circle(display.screen, (255, 60, 60), (hx + pw//2, hy + ph - 4), pulse_r)
+                # countdown above player
+                cd_surf = display.FONT.render(f"{remaining:.1f}s", True, (255, 200, 80))
+                display.screen.blit(cd_surf, (int(player.rect.centerx - camx) - cd_surf.get_width()//2,
+                                              int(player.rect.top - camy) - 22))
+            elif nuke_state[0] == 'falling':
+                _, nx, ny, vy = nuke_state
+                pulse  = abs(math.sin(pygame.time.get_ticks() * 0.012)) * 0.3 + 0.7
+                radius = int(28 * pulse)
+                sx, sy = int(nx - camx), int(ny - camy)
+                pygame.draw.circle(display.screen, (200, 80, 0),   (sx, sy), radius)
+                pygame.draw.circle(display.screen, (255, 200, 50), (sx, sy), radius, 3)
+                # speed lines above to show it's falling
+                for i in range(1, 5):
+                    ly = sy - radius - i * 10
+                    pygame.draw.line(display.screen, (255, 150, int(50*pulse)),
+                                     (sx - 6, ly), (sx + 6, ly), max(1, 3 - i))
+            elif nuke_state[0] == 'blast':
+                _, blast_start, nx, ny, sparks = nuke_state
+                age  = pygame.time.get_ticks() - blast_start
+                t    = age / 2000.0
+                fade = max(0.0, 1.0 - t)
+                sx, sy = int(nx - camx), int(ny - camy)
+                # multiple huge expanding rings
+                for ring_t, ring_col in [(t*1.2, (255,220,80)), (t*0.8, (255,100,0)), (t*0.5, (255,255,200))]:
+                    r = int(min(ring_t, 1.0) * max(C.WIDTH, C.HEIGHT) * 1.5)
+                    if r > 0:
+                        c = (int(ring_col[0]*fade), int(ring_col[1]*fade), int(ring_col[2]*fade))
+                        pygame.draw.circle(display.screen, c, (sx, sy), r, max(1, int(8*fade)))
+                # central flash
+                flash = int(120 * max(0, 1 - age/300))
+                if flash > 0:
+                    pygame.draw.circle(display.screen, (255,255,240), (sx, sy), flash)
+                # sparks
+                age_s = age / 60.0
+                for vx, vy, color in sparks:
+                    px = int(nx + vx * age_s - camx)
+                    py = int(ny + vy * age_s + 0.2 * age_s * age_s - camy)
+                    sz = max(1, int(6 * fade))
+                    fc = (int(color[0]*fade), int(color[1]*fade), int(color[2]*fade))
+                    pygame.draw.circle(display.screen, fc, (px, py), sz)
 
         now = pygame.time.get_ticks()
         lightnings = [l for l in lightnings if l[1] > now]
@@ -582,8 +990,12 @@ def parkour_stage(which_map="old"):
         display.screen.blit(display.FONT.render(f"Deaths: {player.deaths}", True, C.WHITE), (10, 10))
         display.screen.blit(display.FONT.render(
             f"Time: {t:05.2f}s   Speed x{display.TIME_SCALE:.2f} (C toggles)", True, C.WHITE), (10, 30))
+        # Player HP pips
+        for i in range(3):
+            col = (220, 50, 50) if i < player_hp else (60, 20, 20)
+            pygame.draw.rect(display.screen, col, (10 + i * 18, 52, 14, 14), border_radius=3)
         display.screen.blit(display.FONT.render(
-            "Move A/D or L/R  Jump W/Up  Saber:mouse LMB/RMB  E toggle saber  R saber colour  Q place block (red)  Push X  Pull V  Backspace restart",
+            "Move A/D or L/R  Jump W/Up  Saber: mouse  Push X  Pull V  Backspace restart",
             True, C.YELLOW), (10, C.HEIGHT - 28))
         if win:
             msg = display.BIG.render("You cleared the stronghold!", True, C.WHITE)
