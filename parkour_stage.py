@@ -401,15 +401,48 @@ class Grenade:
     def rect(self):
         return pygame.Rect(int(self.x) - 4, int(self.y) - 4, 8, 8)
 
+    BOUNCE_DAMP  = 0.65   # fraction of speed kept after each bounce
+    ROLL_FRICTION = 0.015  # vx lost per frame while rolling on ground
+    ROLL_STOP    = 0.3    # vx below this snaps to zero
+
+    def _solid(self, x, y, ROWS, COLS, get_tile):
+        r = pygame.Rect(int(x) - 4, int(y) - 4, 8, 8)
+        return any(ch == 'X' for (_, _, ch) in tiles_at(r, ROWS, COLS, get_tile))
+
     def update(self, ROWS, COLS, get_tile):
         if not self.alive: return False
         ts = display.TIME_SCALE
         self.vy = min(self.vy + C.GRAVITY * ts, 16)
-        self.x += self.vx * ts
-        self.y += self.vy * ts
-        for (_, _, ch) in tiles_at(self.rect(), ROWS, COLS, get_tile):
-            if ch == 'X':
-                self.alive = False; return True
+
+        nx = self.x + self.vx * ts
+        ny = self.y + self.vy * ts
+
+        hit_x = self._solid(nx, self.y, ROWS, COLS, get_tile)
+        hit_y = self._solid(self.x, ny, ROWS, COLS, get_tile)
+
+        if hit_x:
+            self.vx = -self.vx * self.BOUNCE_DAMP
+            self.vy *= self.BOUNCE_DAMP
+            nx = self.x
+        if hit_y:
+            self.vy = -self.vy * self.BOUNCE_DAMP
+            self.vx *= self.BOUNCE_DAMP
+            ny = self.y
+
+        # rolling: if resting on ground, bleed off horizontal speed with friction
+        on_ground = self._solid(self.x, ny + 1, ROWS, COLS, get_tile)
+        if on_ground and abs(self.vy) < 1.5:
+            self.vy = 0
+            friction = self.ROLL_FRICTION * ts
+            if abs(self.vx) <= self.ROLL_STOP:
+                self.vx = 0
+            elif self.vx > 0:
+                self.vx = max(0.0, self.vx - friction)
+            else:
+                self.vx = min(0.0, self.vx + friction)
+
+        self.x, self.y = nx, ny
+
         if pygame.time.get_ticks() - self.born >= self.FUSE_MS:
             self.alive = False; return True
         return False
@@ -421,11 +454,107 @@ class Grenade:
                            (int(self.x - camx), int(self.y - camy)), 5)
 
 
+class LavaFlow:
+    TICK_MS = 1000  # ms between each drop+expand cycle
+    EXPAND  = 1     # new columns added each side per tick
+
+    def __init__(self, r, c):
+        self.source_r     = r
+        self.source_c     = c
+        self.tiles        = {(r, c)}   # source tile visible immediately
+        self.alive        = True
+        self.col_frontier = {c: r}     # col -> current frontier row
+        self.last_tick    = pygame.time.get_ticks()  # first tick after TICK_MS
+
+    def update(self, ROWS, COLS, get_tile, set_tile, turrets, siths, grenades, bolts):
+        if not self.alive: return
+
+        if get_tile(self.source_r, self.source_c) in ('X', 'B'):
+            self.tiles.clear()
+            self.alive = False
+            return
+
+        now = pygame.time.get_ticks()
+        if now - self.last_tick >= self.TICK_MS:
+            self.last_tick = now
+
+            # drop every active column by 1 independently
+            dropped = set()
+            new_frontier = {}
+            for col, fr in self.col_frontier.items():
+                next_fr = fr + 1
+                if next_fr < ROWS and get_tile(next_fr, col) != 'X':
+                    new_frontier[col] = next_fr
+                    self.tiles.add((next_fr, col))
+                    dropped.add(col)
+                else:
+                    new_frontier[col] = fr  # blocked — stays in place
+            self.col_frontier = new_frontier
+
+            # only expand from an outer edge if that edge column actually dropped
+            if self.col_frontier:
+                left_col  = min(self.col_frontier)
+                right_col = max(self.col_frontier)
+                for edge_col, step in ((left_col, -1), (right_col, 1)):
+                    if edge_col not in dropped:
+                        continue  # this edge hit the floor/block — no expansion
+                    fr = self.col_frontier[edge_col]
+                    for i in range(1, self.EXPAND + 1):
+                        nc = edge_col + step * i
+                        if not (0 <= nc < COLS) or get_tile(fr, nc) == 'X':
+                            break  # wall or map edge — stop expanding this direction
+                        if nc not in self.col_frontier:
+                            self.col_frontier[nc] = fr
+                            self.tiles.add((fr, nc))
+
+        # destroy everything except blocks under lava tiles
+        for (r, c) in list(self.tiles):
+            ch = get_tile(r, c)
+            if ch in ('X', '.'):
+                continue
+            if ch == '^':
+                for t in turrets[:]:
+                    if t.r == r and t.c == c:
+                        turrets.remove(t)
+            set_tile(r, c, '.')
+
+        # destroy sith lords standing in lava
+        for s in siths[:]:
+            sr = s.rect.centery // C.TILE
+            sc = s.rect.centerx // C.TILE
+            if (sr, sc) in self.tiles:
+                siths.remove(s)
+
+        # destroy grenades (circles) and bolts (circles) caught in lava
+        for g in grenades[:]:
+            if (int(g.y) // C.TILE, int(g.x) // C.TILE) in self.tiles:
+                grenades.remove(g)
+        for b in bolts[:]:
+            if (int(b.y) // C.TILE, int(b.x) // C.TILE) in self.tiles:
+                b.alive = False
+
+    def player_touching(self, player):
+        pr0 = player.rect.top    // C.TILE
+        pr1 = player.rect.bottom // C.TILE
+        pc0 = player.rect.left   // C.TILE
+        pc1 = player.rect.right  // C.TILE
+        return any(pr0 <= r <= pr1 and pc0 <= c <= pc1 for (r, c) in self.tiles)
+
+    def draw(self, camx, camy):
+        ts = C.TILE
+        for (r, c) in self.tiles:
+            x = c * ts - int(camx)
+            y = r * ts - int(camy)
+            pygame.draw.rect(display.screen, (220, 55, 0),   (x, y, ts, ts))
+            pygame.draw.rect(display.screen, (255, 180, 20), (x + 3, y + 3, ts - 6, 8), border_radius=3)
+
+
 class Bolt:
     def __init__(self, x, y, vx, vy):
         self.x  = float(x); self.y  = float(y)
         self.vx = float(vx); self.vy = float(vy)
         self.r  = 4; self.alive = True; self.friendly = False
+        self.prev_x = self.x; self.prev_y = self.y
 
     def rect(self):
         return pygame.Rect(int(self.x) - self.r, int(self.y) - self.r, self.r * 2, self.r * 2)
@@ -433,6 +562,7 @@ class Bolt:
     def update(self, ROWS, COLS, get_tile):
         if not self.alive: return
         ts = display.TIME_SCALE
+        self.prev_x = self.x; self.prev_y = self.y
         self.x += self.vx * ts; self.y += self.vy * ts
         if (self.x < -10 or self.x > COLS * C.TILE + 10 or
                 self.y < -10 or self.y > ROWS * C.TILE + 10):
@@ -530,6 +660,7 @@ def parkour_stage(which_map="old"):
     saber_switching = False
     lightnings      = []  # list of (world_points, expire_ms)
     grenades             = []
+    lava_flows           = []
     explosions           = []  # list of (wx, wy, start_ms, sparks)
     crumbling_effects    = []  # list of (wx, wy, start_ms, pieces)
     grenade_charge_start = None
@@ -543,7 +674,7 @@ def parkour_stage(which_map="old"):
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings, grenades, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -554,7 +685,7 @@ def parkour_stage(which_map="old"):
         turrets = [Turret(r, c) for (r, c) in sp]; bolts = []
         camx = camy = 0.0; win = False
         saber_len = saber_target = float(C.SABER_LEN); saber_color = C.CYAN; saber_switching = False
-        lightnings = []; grenades = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
+        lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
         player_hp = 3; player_flash_until = 0; red_seq.clear()
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
@@ -593,6 +724,10 @@ def parkour_stage(which_map="old"):
                     nuke_state = ('phone', pygame.time.get_ticks(), float(player.rect.centerx))
                 if e.key == pygame.K_g and saber_color == C.RED:
                     grenade_charge_start = pygame.time.get_ticks()
+                if e.key == pygame.K_o and saber_color == C.RED:
+                    mx, my = pygame.mouse.get_pos()
+                    lava_flows.append(LavaFlow(int(my + camy) // C.TILE,
+                                               int(mx + camx) // C.TILE))
                 if e.key == pygame.K_BACKSPACE:
                     _request_restart_flag[0] = True; _death_pending_flag[0] = False
                 if e.key == pygame.K_ESCAPE:
@@ -777,6 +912,12 @@ def parkour_stage(which_map="old"):
                 do_explode(g.x, g.y)
                 grenades.remove(g)
 
+        for lf in lava_flows:
+            lf.update(ROWS, COLS, get_tile, set_tile, turrets, siths, grenades, bolts)
+            if lf.alive and lf.player_touching(player):
+                _request_restart_flag[0] = True; _death_pending_flag[0] = True
+        lava_flows = [lf for lf in lava_flows if lf.alive]
+
         explosions        = [e for e in explosions        if pygame.time.get_ticks() - e[2] < 700]
         crumbling_effects = [e for e in crumbling_effects if pygame.time.get_ticks() - e[2] < 450]
 
@@ -796,6 +937,7 @@ def parkour_stage(which_map="old"):
             turrets.clear()
             bolts.clear()
             grenades.clear()
+            lava_flows.clear()
             crumbling_effects.clear()
             explosions.clear()
             sparks = []
@@ -835,9 +977,31 @@ def parkour_stage(which_map="old"):
         thresh_sq   = (C.SABER_THICKNESS / 2 + 4) ** 2
         for b in bolts:
             if not b.alive: continue
-            if point_seg_dist_sq(b.x, b.y, *saber_p1, *saber_p2) <= thresh_sq:
-                if rmb: b.alive = False
-                else:   b.vx *= -1; b.vy *= -1; b.friendly = True
+            hit = (point_seg_dist_sq(b.x, b.y, *saber_p1, *saber_p2) <= thresh_sq or
+                   seg_intersect((b.prev_x, b.prev_y), (b.x, b.y), saber_p1, saber_p2))
+            if hit:
+                if rmb:
+                    b.alive = False
+                else:
+                    tip_dist_sq = (b.x - saber_p2[0])**2 + (b.y - saber_p2[1])**2
+                    if tip_dist_sq <= thresh_sq:
+                        b.vx *= -1; b.vy *= -1
+                    else:
+                        # reflect bolt off the lightsaber blade surface
+                        sx = saber_p2[0] - saber_p1[0]; sy = saber_p2[1] - saber_p1[1]
+                        sd = (sx*sx + sy*sy) ** 0.5
+                        if sd > 0:
+                            sx /= sd; sy /= sd
+                            nx, ny = -sy, sx
+                            dot = b.vx * nx + b.vy * ny
+                            b.vx -= 2 * dot * nx; b.vy -= 2 * dot * ny
+                    b.friendly = True
+                    # push bolt clear of the detection zone so it can't re-collide next frame
+                    bspeed = (b.vx**2 + b.vy**2) ** 0.5
+                    if bspeed > 0:
+                        clear = thresh_sq ** 0.5 + b.r + 2
+                        b.x += b.vx / bspeed * clear
+                        b.y += b.vy / bspeed * clear
                 continue
             if not b.friendly and b.rect().colliderect(player.rect):
                 b.alive = False; _request_restart_flag[0] = True; _death_pending_flag[0] = True
@@ -871,6 +1035,7 @@ def parkour_stage(which_map="old"):
         draw_player(player, camx, camy, saber_p1, saber_p2, saber_color,
                     flash=pygame.time.get_ticks() < player_flash_until)
         for s in siths: s.draw(display.screen, camx, camy)
+        for lf in lava_flows: lf.draw(camx, camy)
         for g in grenades: g.draw(camx, camy)
         if grenade_charge_start is not None:
             charge = min((pygame.time.get_ticks() - grenade_charge_start) / 1500.0, 1.0)

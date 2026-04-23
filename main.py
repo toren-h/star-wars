@@ -1,4 +1,3 @@
-import sys
 import pygame
 import display
 from space_stage import space_stage
