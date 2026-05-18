@@ -103,6 +103,53 @@ def seg_intersect(p1, p2, q1, q2):
         return (C[1] - A[1]) * (B[0] - A[0]) < (B[1] - A[1]) * (C[0] - A[0])
     return (ccw(p1, q1, q2) != ccw(p2, q1, q2)) and (ccw(p1, p2, q1) != ccw(p1, p2, q2))
 
+def seg_intersect_point(p1, p2, q1, q2):
+    dx1, dy1 = p2[0]-p1[0], p2[1]-p1[1]
+    dx2, dy2 = q2[0]-q1[0], q2[1]-q1[1]
+    denom = dx1*dy2 - dy1*dx2
+    if abs(denom) < 1e-10:
+        return None
+    t = ((q1[0]-p1[0])*dy2 - (q1[1]-p1[1])*dx2) / denom
+    s = ((q1[0]-p1[0])*dy1 - (q1[1]-p1[1])*dx1) / denom
+    if 0.0 <= t <= 1.0 and 0.0 <= s <= 1.0:
+        return (p1[0] + t*dx1, p1[1] + t*dy1)
+    return None
+
+def _saber_clip_at_zone(p1, p2, zone_p1, zone_p2, thresh_sq):
+    """Return the first point on p1→p2 that is within sqrt(thresh_sq) of segment
+    zone_p1→zone_p2, or None.
+
+    Fast path: exact geometric centreline intersection.
+    Fallback: binary-search for where the saber tip first enters the thick zone.
+    Guard: if the saber origin is already inside the zone we return None (degenerate).
+    """
+    zx1, zy1, zx2, zy2 = zone_p1[0], zone_p1[1], zone_p2[0], zone_p2[1]
+
+    # Fast path — exact centreline crossing
+    pt = seg_intersect_point(p1, p2, zone_p1, zone_p2)
+    if pt is not None:
+        return pt
+
+    # If the tip is not inside the zone, the saber never enters it
+    if point_seg_dist_sq(p2[0], p2[1], zx1, zy1, zx2, zy2) > thresh_sq:
+        return None
+
+    # Guard: if the origin is already inside the zone we cannot clip meaningfully
+    if point_seg_dist_sq(p1[0], p1[1], zx1, zy1, zx2, zy2) <= thresh_sq:
+        return None
+
+    # Binary-search for the entry point (first t where dist² ≤ thresh_sq)
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    lo, hi = 0.0, 1.0
+    for _ in range(20):          # 20 iterations → ~1e-6 precision
+        mid = (lo + hi) * 0.5
+        px, py = p1[0] + mid * dx, p1[1] + mid * dy
+        if point_seg_dist_sq(px, py, zx1, zy1, zx2, zy2) <= thresh_sq:
+            hi = mid
+        else:
+            lo = mid
+    return (p1[0] + hi * dx, p1[1] + hi * dy)
+
 def seg_intersects_rect(p1, p2, rect):
     if rect.collidepoint(p1) or rect.collidepoint(p2):
         return True
@@ -211,7 +258,17 @@ class SithLord:
         self.state_start = now
         self.flash_until = now + 150
 
-    def update(self, player):
+    def _has_ground_ahead(self, step, ROWS, COLS, get_tile):
+        # Check tile directly below the leading edge after stepping
+        check_x = self.rect.right if step > 0 else self.rect.left - 1
+        check_y = self.rect.bottom + 1
+        c = check_x // C.TILE
+        r = check_y // C.TILE
+        if r < 0 or r >= ROWS or c < 0 or c >= COLS:
+            return False
+        return get_tile(r, c) == 'X'
+
+    def update(self, player, ROWS=None, COLS=None, get_tile=None):
         now = pygame.time.get_ticks()
         ts  = display.TIME_SCALE
         sx, sy = float(self.rect.centerx), float(self.rect.centery)
@@ -223,8 +280,9 @@ class SithLord:
 
         if self.state == 'approach':
             if dist > self.STRIKE_RANGE_PX:
-                move = min(self.APPROACH_SPEED * ts, dist - self.STRIKE_RANGE_PX)
-                self.rect.x += int(self.face_dir * max(1, move))
+                move = int(self.face_dir * max(1, min(self.APPROACH_SPEED * ts, dist - self.STRIKE_RANGE_PX)))
+                if get_tile is None or self._has_ground_ahead(move, ROWS, COLS, get_tile):
+                    self.rect.x += move
             else:
                 self.state = 'windup'; self.state_start = now
         elif self.state == 'windup':
@@ -572,6 +630,70 @@ class Bolt:
             self.alive = False
 
 
+class GunPickup:
+    W, H = 22, 10
+
+    def __init__(self, cx, bottom_y):
+        self.rect = pygame.Rect(cx - self.W // 2, bottom_y - self.H, self.W, self.H)
+        self.vy = 0.0
+
+    def update(self, ROWS, COLS, get_tile):
+        ts = display.TIME_SCALE
+        self.vy = min(self.vy + C.GRAVITY * ts, 16)
+        self.rect.y += int(round(self.vy * ts))
+        for (r, c, ch) in tiles_at(self.rect, ROWS, COLS, get_tile):
+            if ch == 'X':
+                t = rect_for_tile(r, c)
+                if self.rect.colliderect(t) and self.vy >= 0:
+                    self.rect.bottom = t.top
+                    self.vy = 0.0
+                    return
+
+    def draw(self, screen, camx, camy):
+        x, y = self.rect.x - int(camx), self.rect.y - int(camy)
+        pygame.draw.rect(screen, (10, 10, 12),   (x, y, self.W, self.H))
+        pygame.draw.rect(screen, (90, 90, 100),  (x, y, self.W, self.H), 1)
+        pygame.draw.rect(screen, (50, 50, 60),   (x + self.W - 6, y + 2, 6, self.H - 4))
+
+
+class Rocket:
+    SPEED      = 5.0
+    EXP_RADIUS = 200  # ~5 tiles, twice grenade radius
+
+    def __init__(self, x, y, vx, vy):
+        self.x, self.y   = float(x), float(y)
+        self.vx, self.vy = float(vx), float(vy)
+        self.r     = 8
+        self.alive = True
+        self.prev_x = self.x; self.prev_y = self.y
+
+    def rect(self):
+        return pygame.Rect(int(self.x) - self.r, int(self.y) - self.r, self.r * 2, self.r * 2)
+
+    def update(self, ROWS, COLS, get_tile):
+        if not self.alive: return False
+        ts = display.TIME_SCALE
+        self.prev_x = self.x; self.prev_y = self.y
+        self.x += self.vx * ts
+        self.y += self.vy * ts
+        if (self.x < -20 or self.x > COLS * C.TILE + 20 or
+                self.y < -20 or self.y > ROWS * C.TILE + 20):
+            self.alive = False; return False
+        rc, cc = int(self.y) // C.TILE, int(self.x) // C.TILE
+        if 0 <= rc < ROWS and 0 <= cc < COLS and get_tile(rc, cc) in ('X', 'B'):
+            self.alive = False; return True
+        return False
+
+    def draw(self, camx, camy):
+        sx, sy = int(self.x - camx), int(self.y - camy)
+        pygame.draw.circle(display.screen, (80, 40, 0),   (sx, sy), self.r)
+        pygame.draw.circle(display.screen, (255, 80, 0),  (sx, sy), self.r - 2)
+        pygame.draw.circle(display.screen, (255, 220, 80),(sx, sy), self.r - 5)
+        trail_x = sx - int(self.vx * 2)
+        trail_y = sy - int(self.vy * 2)
+        pygame.draw.line(display.screen, (255, 120, 0), (sx, sy), (trail_x, trail_y), 5)
+
+
 # ---- Draw helpers ----
 def draw_level(level_grid, ROWS, COLS, camx, camy):
     c0 = max(0,    int(camx // C.TILE) - 2);   c1 = min(COLS, int((camx + C.WIDTH)  // C.TILE) + 3)
@@ -656,6 +778,7 @@ def parkour_stage(which_map="old"):
     win  = False
     saber_len       = float(C.SABER_LEN)
     saber_target    = float(C.SABER_LEN)
+    saber_active    = True
     saber_color     = C.CYAN
     saber_switching = False
     lightnings      = []  # list of (world_points, expire_ms)
@@ -670,11 +793,20 @@ def parkour_stage(which_map="old"):
     player_hp            = 3
     player_flash_until   = 0
     red_seq              = []   # tracks progress through R-E-D combo
+    gun_count         = 0
+    active_weapon     = 'saber'
+    last_gun_shot     = 0
+    last_bazooka_shot = 0
+    gun_pickups       = []
+    rockets           = []
+    GUN_COOLDOWN      = 500
+    BAZOOKA_COOLDOWN  = 1500
+    grenade_count     = 3
     _request_restart_flag[0] = False
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, last_bazooka_shot, gun_pickups, rockets, grenade_count
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -684,9 +816,10 @@ def parkour_stage(which_map="old"):
         player = Player(*START); player.deaths = deaths
         turrets = [Turret(r, c) for (r, c) in sp]; bolts = []
         camx = camy = 0.0; win = False
-        saber_len = saber_target = float(C.SABER_LEN); saber_color = C.CYAN; saber_switching = False
+        saber_len = saber_target = float(C.SABER_LEN); saber_active = True; saber_color = C.CYAN; saber_switching = False
         lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
         player_hp = 3; player_flash_until = 0; red_seq.clear()
+        gun_count = 0; active_weapon = 'saber'; last_gun_shot = 0; last_bazooka_shot = 0; gun_pickups = []; rockets = []; grenade_count = 3
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
 
@@ -703,7 +836,7 @@ def parkour_stage(which_map="old"):
                 if e.key == pygame.K_c:   display.toggle_slow()
                 if e.key in (pygame.K_w, pygame.K_UP): player.jump()
                 if e.key == pygame.K_e:
-                    saber_target = 0.0 if saber_target > 0 else float(C.SABER_LEN)
+                    saber_active = not saber_active
                 if e.key == pygame.K_x:   force_push(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_v:   force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 # R-E-D sequence activates color switch
@@ -728,10 +861,45 @@ def parkour_stage(which_map="old"):
                     mx, my = pygame.mouse.get_pos()
                     lava_flows.append(LavaFlow(int(my + camy) // C.TILE,
                                                int(mx + camx) // C.TILE))
+                if e.key == pygame.K_p:
+                    for gp in gun_pickups[:]:
+                        if gp.rect.colliderect(player.rect):
+                            gun_count += 1
+                            gun_pickups.remove(gp)
+                            break
+                if e.key == pygame.K_1:
+                    active_weapon = 'saber'
+                    grenade_charge_start = None
+                if e.key == pygame.K_2 and grenade_count > 0:
+                    active_weapon = 'grenade'
+                    grenade_charge_start = None
+                if e.key == pygame.K_3 and gun_count >= 1:
+                    active_weapon = 'gun'
+                    grenade_charge_start = None
+                if e.key == pygame.K_4 and gun_count >= 10:
+                    active_weapon = 'bazooka'
+                    grenade_charge_start = None
                 if e.key == pygame.K_BACKSPACE:
                     _request_restart_flag[0] = True; _death_pending_flag[0] = False
                 if e.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit()
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                if e.button == 1 and active_weapon == 'grenade' and grenade_count > 0 and grenade_charge_start is None:
+                    grenade_charge_start = pygame.time.get_ticks()
+            elif e.type == pygame.MOUSEBUTTONUP:
+                if e.button == 1 and active_weapon == 'grenade' and grenade_charge_start is not None:
+                    hold_ms = pygame.time.get_ticks() - grenade_charge_start
+                    speed = 4.0 + 16.0 * min(hold_ms / 1500.0, 1.0)
+                    mx, my = pygame.mouse.get_pos()
+                    tx, ty = mx + camx, my + camy
+                    pcx, pcy = float(player.rect.centerx), float(player.rect.centery)
+                    dx, dy = tx - pcx, ty - pcy
+                    d = max(1.0, math.hypot(dx, dy))
+                    grenades.append(Grenade(pcx, pcy, dx / d * speed, dy / d * speed))
+                    grenade_charge_start = None
+                    grenade_count -= 1
+                    if grenade_count <= 0:
+                        active_weapon = 'saber'
             elif e.type == pygame.KEYUP:
                 if e.key == pygame.K_g and grenade_charge_start is not None:
                     hold_ms = pygame.time.get_ticks() - grenade_charge_start
@@ -786,6 +954,7 @@ def parkour_stage(which_map="old"):
                 if seg_intersects_rect(lp1, lp2, t.rect):
                     if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                         set_tile(t.r, t.c, '.')
+                    gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
                     turrets.remove(t)
 
         now_t = pygame.time.get_ticks()
@@ -802,6 +971,7 @@ def parkour_stage(which_map="old"):
                 if seg_intersects_rect(lp1, lp2, t.rect):
                     if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                         set_tile(t.r, t.c, '.')
+                    gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
                     turrets.remove(t)
 
         if saber_color == C.RED:
@@ -816,6 +986,14 @@ def parkour_stage(which_map="old"):
                     if not t.falling and t.r == tr - 1 and t.c == tc:
                         t.start_fall(ROWS, COLS, get_tile, set_tile)
 
+        if active_weapon in ('gun', 'grenade', 'bazooka'):
+            saber_target = 0.0
+        elif not saber_switching:
+            shift_held = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            if saber_active:
+                saber_target = float(C.SABER_LEN) * (1.6 if shift_held else 1.0)
+            else:
+                saber_target = 0.0
         step = 2.5 * display.TIME_SCALE
         if saber_len < saber_target:
             saber_len = min(saber_len + step, saber_target)
@@ -823,7 +1001,6 @@ def parkour_stage(which_map="old"):
             saber_len = max(saber_len - step, saber_target)
         if saber_switching and saber_len == 0.0:
             saber_color = C.RED if saber_color == C.CYAN else C.CYAN
-            saber_target = float(C.SABER_LEN)
             saber_switching = False
 
         mx, my   = pygame.mouse.get_pos()
@@ -835,9 +1012,51 @@ def parkour_stage(which_map="old"):
         saber_p1 = (pcx, pcy)
         saber_p2 = (pcx + ux * saber_len, pcy + uy * saber_len)
 
+        for s in siths:
+            s.update(player, ROWS, COLS, get_tile)
+
+        # Two 8-px-thick sabers visually overlap when their centrelines are within
+        # SABER_THICKNESS px of each other (4 px half-thickness each side).
+        _ZONE_SQ = C.SABER_THICKNESS ** 2   # = 64
+
+        # Save the unclipped player saber — we MUST use this (not the clipped version)
+        # when checking the Sith's saber, otherwise the endpoint lies exactly on the
+        # zone boundary (s ≈ 1.0) and floating-point causes seg_intersect_point to
+        # return None, leaving the Sith's saber unclipped.
+        saber_p2_orig = saber_p2
+
+        # Find where the player's saber first enters each Sith's saber zone.
+        sith_clash_pts = {}
+        for s in siths:
+            pt = _saber_clip_at_zone(saber_p1, saber_p2, s.p1, s.p2, _ZONE_SQ)
+            if pt is not None:
+                sith_clash_pts[id(s)] = pt
+
+        sith_clashes = {id(s): id(s) in sith_clash_pts for s in siths}
+
+        # Clip player's saber at the nearest clash point.
+        closest_pt = None
+        closest_dsq = float('inf')
+        for s in siths:
+            pt = sith_clash_pts.get(id(s))
+            if pt is not None:
+                dsq = (pt[0]-saber_p1[0])**2 + (pt[1]-saber_p1[1])**2
+                if dsq < closest_dsq:
+                    closest_dsq = dsq
+                    closest_pt = pt
+        if closest_pt is not None:
+            saber_p2 = closest_pt
+
+        # Clip each Sith's saber against the ORIGINAL (un-clipped) player saber.
+        # Using saber_p2_orig means the Sith saber crosses the player saber in the
+        # interior (t < 1), so seg_intersect_point never hits the s=1.0 edge case.
+        for s in siths:
+            pt = _saber_clip_at_zone(s.p1, s.p2, saber_p1, saber_p2_orig, _ZONE_SQ)
+            if pt is not None:
+                s.p2 = pt
+
         for s in siths[:]:
-            s.update(player)
-            sabers_clash        = seg_intersect(saber_p1, saber_p2, s.p1, s.p2)
+            sabers_clash        = sith_clashes[id(s)]
             player_hits_body    = seg_intersects_rect(saber_p1, saber_p2, s.rect)
 
             if sabers_clash and s.state in ('windup', 'strike'):
@@ -846,7 +1065,7 @@ def parkour_stage(which_map="old"):
                 if s.take_hit():
                     siths.remove(s); continue
 
-            if s in siths and s.check_hit_on_player(player):
+            if s in siths and not sabers_clash and s.check_hit_on_player(player):
                 player_hp -= 1
                 player_flash_until = pygame.time.get_ticks() + 350
                 s.state = 'recover'; s.state_start = pygame.time.get_ticks()
@@ -858,6 +1077,7 @@ def parkour_stage(which_map="old"):
             if seg_intersects_rect(saber_p1, saber_p2, t.rect):
                 if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                     set_tile(t.r, t.c, '.')
+                gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
                 turrets.remove(t)
         for t in turrets[:]: t.check_support_and_maybe_fall(ROWS, COLS, get_tile)
         for t in turrets[:]:
@@ -866,20 +1086,20 @@ def parkour_stage(which_map="old"):
         for b in bolts:
             if b.alive: b.update(ROWS, COLS, get_tile)
 
-        def do_explode(gx, gy):
+        def do_explode(gx, gy, radius=Grenade.EXP_RADIUS):
             sparks = []
-            for _ in range(20):
+            spark_count = 20 + int(20 * (radius / Grenade.EXP_RADIUS - 1))
+            for _ in range(spark_count):
                 angle = random.uniform(0, 2 * math.pi)
                 speed = random.uniform(2.0, 7.0)
                 sparks.append((math.cos(angle) * speed, math.sin(angle) * speed,
                                random.choice([(255,220,80),(255,140,0),(255,60,0),(255,255,180)])))
-            explosions.append((gx, gy, pygame.time.get_ticks(), sparks))
-            r = Grenade.EXP_RADIUS
+            explosions.append((gx, gy, pygame.time.get_ticks(), sparks, radius))
             for row in range(ROWS):
                 for col in range(COLS):
                     tx = col * C.TILE + C.TILE // 2
                     ty = row * C.TILE + C.TILE // 2
-                    if math.hypot(tx - gx, ty - gy) <= r and get_tile(row, col) in ('B', 'X'):
+                    if math.hypot(tx - gx, ty - gy) <= radius and get_tile(row, col) in ('B', 'X'):
                         set_tile(row, col, '.')
                         pieces = []
                         for _ in range(6):
@@ -888,14 +1108,15 @@ def parkour_stage(which_map="old"):
                             pieces.append((math.cos(a)*sp, math.sin(a)*sp, random.randint(4,10)))
                         crumbling_effects.append((float(tx), float(ty), pygame.time.get_ticks(), pieces))
             for s in siths[:]:
-                if math.hypot(s.rect.centerx - gx, s.rect.centery - gy) <= r:
+                if math.hypot(s.rect.centerx - gx, s.rect.centery - gy) <= radius:
                     siths.remove(s)
             for t in turrets[:]:
-                if math.hypot(t.rect.centerx - gx, t.rect.centery - gy) <= r:
+                if math.hypot(t.rect.centerx - gx, t.rect.centery - gy) <= radius:
                     if not t.falling and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                         set_tile(t.r, t.c, '.')
+                    gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
                     turrets.remove(t)
-            if math.hypot(player.rect.centerx - gx, player.rect.centery - gy) <= r:
+            if math.hypot(player.rect.centerx - gx, player.rect.centery - gy) <= radius:
                 _request_restart_flag[0] = True; _death_pending_flag[0] = True
 
         for g in grenades[:]:
@@ -911,6 +1132,23 @@ def parkour_stage(which_map="old"):
             if detonated:
                 do_explode(g.x, g.y)
                 grenades.remove(g)
+
+        for rk in rockets[:]:
+            hit_wall = rk.update(ROWS, COLS, get_tile)
+            if not rk.alive:
+                if hit_wall:
+                    do_explode(rk.x, rk.y, Rocket.EXP_RADIUS)
+                continue
+            for s in siths[:]:
+                if rk.rect().colliderect(s.rect):
+                    do_explode(rk.x, rk.y, Rocket.EXP_RADIUS)
+                    rk.alive = False; break
+            if rk.alive:
+                for t in turrets[:]:
+                    if rk.rect().colliderect(t.rect):
+                        do_explode(rk.x, rk.y, Rocket.EXP_RADIUS)
+                        rk.alive = False; break
+        rockets = [rk for rk in rockets if rk.alive]
 
         for lf in lava_flows:
             lf.update(ROWS, COLS, get_tile, set_tile, turrets, siths, grenades, bolts)
@@ -973,10 +1211,36 @@ def parkour_stage(which_map="old"):
 
         camx, camy = center_camera_on_player(camx, camy, player, ROWS, COLS)
 
+        for gp in gun_pickups:
+            gp.update(ROWS, COLS, get_tile)
+
         lmb, _, rmb = pygame.mouse.get_pressed(3)
+        if active_weapon == 'gun' and lmb:
+            now_g = pygame.time.get_ticks()
+            if now_g - last_gun_shot >= GUN_COOLDOWN:
+                last_gun_shot = now_g
+                mx, my = pygame.mouse.get_pos()
+                tx, ty = float(mx + camx), float(my + camy)
+                pcx_g, pcy_g = float(player.rect.centerx), float(player.rect.centery)
+                dx, dy = tx - pcx_g, ty - pcy_g
+                d = max(1.0, math.hypot(dx, dy))
+                gb = Bolt(pcx_g, pcy_g, dx / d * C.BOLT_SPEED, dy / d * C.BOLT_SPEED)
+                gb.friendly = True
+                bolts.append(gb)
+        if active_weapon == 'bazooka' and lmb:
+            now_bz = pygame.time.get_ticks()
+            if now_bz - last_bazooka_shot >= BAZOOKA_COOLDOWN:
+                last_bazooka_shot = now_bz
+                mx, my = pygame.mouse.get_pos()
+                tx, ty = float(mx + camx), float(my + camy)
+                pcx_bz, pcy_bz = float(player.rect.centerx), float(player.rect.centery)
+                dx, dy = tx - pcx_bz, ty - pcy_bz
+                d = max(1.0, math.hypot(dx, dy))
+                rockets.append(Rocket(pcx_bz, pcy_bz, dx / d * Rocket.SPEED, dy / d * Rocket.SPEED))
         thresh_sq   = (C.SABER_THICKNESS / 2 + 4) ** 2
         for b in bolts:
             if not b.alive: continue
+            if b.friendly: continue  # gun shots and reflected bolts skip saber interaction
             hit = (point_seg_dist_sq(b.x, b.y, *saber_p1, *saber_p2) <= thresh_sq or
                    seg_intersect((b.prev_x, b.prev_y), (b.x, b.y), saber_p1, saber_p2))
             if hit:
@@ -1012,7 +1276,15 @@ def parkour_stage(which_map="old"):
                 if t.rect.colliderect(b.rect()):
                     if (not t.falling) and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                         set_tile(t.r, t.c, '.')
+                    gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
                     turrets.remove(t); b.alive = False; break
+            if not b.alive: continue
+            for s in siths[:]:
+                if s.rect.colliderect(b.rect()):
+                    if s.take_hit():
+                        siths.remove(s)
+                    b.alive = False
+                    break
 
         minx = int(max(0,      (min(saber_p1[0], saber_p2[0]) - C.SABER_THICKNESS) // C.TILE))
         maxx = int(min(COLS-1, (max(saber_p1[0], saber_p2[0]) + C.SABER_THICKNESS) // C.TILE))
@@ -1032,8 +1304,41 @@ def parkour_stage(which_map="old"):
         draw_level(level_grid, ROWS, COLS, camx, camy)
         draw_falling_turrets(turrets, camx, camy)
         draw_bolts(bolts, camx, camy)
-        draw_player(player, camx, camy, saber_p1, saber_p2, saber_color,
-                    flash=pygame.time.get_ticks() < player_flash_until)
+        draw_player(player, camx, camy, saber_p1,
+                    saber_p1 if active_weapon in ('gun', 'grenade', 'bazooka') else saber_p2,
+                    saber_color, flash=pygame.time.get_ticks() < player_flash_until)
+        if active_weapon == 'grenade' and grenade_count > 0:
+            hx = int(player.rect.centerx - camx) + player.face_dir * 14
+            hy = int(player.rect.centery  - camy) + 6
+            if grenade_charge_start is not None:
+                charge = min((pygame.time.get_ticks() - grenade_charge_start) / 1500.0, 1.0)
+                gcol = (255, int(200 - 150 * charge), 50) if charge < 0.7 else (255, 50, 50)
+            else:
+                gcol = (255, 200, 50)
+            pygame.draw.circle(display.screen, gcol, (hx, hy), 6)
+        if active_weapon in ('gun', 'bazooka'):
+            mx, my = pygame.mouse.get_pos()
+            pcx_d = player.rect.centerx - camx
+            pcy_d = player.rect.centery - camy
+            dx, dy = mx - pcx_d, my - pcy_d
+            d = max(1.0, math.hypot(dx, dy))
+            ux, uy = dx / d, dy / d
+            if active_weapon == 'bazooka':
+                pygame.draw.line(display.screen, (80, 40, 0),
+                                 (int(pcx_d), int(pcy_d)),
+                                 (int(pcx_d + ux * 32), int(pcy_d + uy * 32)), 12)
+                pygame.draw.line(display.screen, (200, 100, 30),
+                                 (int(pcx_d), int(pcy_d)),
+                                 (int(pcx_d + ux * 32), int(pcy_d + uy * 32)), 4)
+            else:
+                pygame.draw.line(display.screen, (10, 10, 12),
+                                 (int(pcx_d), int(pcy_d)),
+                                 (int(pcx_d + ux * 22), int(pcy_d + uy * 22)), 7)
+                pygame.draw.line(display.screen, (110, 110, 120),
+                                 (int(pcx_d), int(pcy_d)),
+                                 (int(pcx_d + ux * 22), int(pcy_d + uy * 22)), 2)
+        for gp in gun_pickups: gp.draw(display.screen, camx, camy)
+        for rk in rockets: rk.draw(camx, camy)
         for s in siths: s.draw(display.screen, camx, camy)
         for lf in lava_flows: lf.draw(camx, camy)
         for g in grenades: g.draw(camx, camy)
@@ -1043,25 +1348,25 @@ def parkour_stage(which_map="old"):
             by = int(player.rect.top - camy) - 12
             pygame.draw.rect(display.screen, (80, 80, 80),   (bx, by, 40, 6))
             pygame.draw.rect(display.screen, (255, 140, 0),  (bx, by, int(40 * charge), 6))
-        for ex, ey, start, sparks in explosions:
+        for ex, ey, start, sparks, exp_r in explosions:
             age  = pygame.time.get_ticks() - start
             t    = age / 700.0          # 0→1 over lifetime
             fade = max(0, 1.0 - t)
             sx, sy = int(ex - camx), int(ey - camy)
 
             # central flash (bright white → yellow, shrinks fast)
-            flash_r = int(Grenade.EXP_RADIUS * 0.5 * max(0, 1 - age / 120))
+            flash_r = int(exp_r * 0.5 * max(0, 1 - age / 120))
             if flash_r > 0:
                 pygame.draw.circle(display.screen, (255, 255, 220), (sx, sy), flash_r)
 
             # slow outer ring (orange → red, expands to full radius)
-            r1 = int(Grenade.EXP_RADIUS * min(t * 1.4, 1.0))
+            r1 = int(exp_r * min(t * 1.4, 1.0))
             if r1 > 0:
                 c1 = (255, int(120 * fade), 0)
                 pygame.draw.circle(display.screen, c1, (sx, sy), r1, 3)
 
             # fast inner ring (yellow, expands to 60% radius quickly)
-            r2 = int(Grenade.EXP_RADIUS * 0.6 * min(t * 2.5, 1.0))
+            r2 = int(exp_r * 0.6 * min(t * 2.5, 1.0))
             if r2 > 0:
                 c2 = (255, int(220 * fade), int(80 * fade))
                 pygame.draw.circle(display.screen, c2, (sx, sy), r2, 2)
@@ -1159,6 +1464,21 @@ def parkour_stage(which_map="old"):
         for i in range(3):
             col = (220, 50, 50) if i < player_hp else (60, 20, 20)
             pygame.draw.rect(display.screen, col, (10 + i * 18, 52, 14, 14), border_radius=3)
+        # Weapon slots
+        saber_c = C.CYAN  if active_weapon == 'saber'   else (40, 80, 100)
+        gren_c  = C.YELLOW if active_weapon == 'grenade' else ((80, 80, 30) if grenade_count == 0 else (140, 120, 40))
+        display.screen.blit(display.FONT.render("[1] SABER", True, saber_c), (10, 70))
+        display.screen.blit(display.FONT.render(f"[2] GRENADE x{grenade_count}", True, gren_c), (110, 70))
+        if gun_count >= 1:
+            gun_c = C.WHITE if active_weapon == 'gun' else (80, 80, 90)
+            display.screen.blit(display.FONT.render("[3] GUN", True, gun_c), (280, 70))
+        elif gun_pickups:
+            display.screen.blit(display.FONT.render(f"[P] GUN ({gun_count}/10 BZOOKA)", True, (160, 160, 80)), (280, 70))
+        if gun_count >= 10:
+            baz_c = C.WHITE if active_weapon == 'bazooka' else (200, 120, 40)
+            display.screen.blit(display.FONT.render("[4] BAZOOKA", True, baz_c), (390, 70))
+        elif gun_count >= 1:
+            display.screen.blit(display.FONT.render(f"({gun_count}/10 BAZOOKA)", True, (120, 100, 40)), (390, 70))
         display.screen.blit(display.FONT.render(
             "Move A/D or L/R  Jump W/Up  Saber: mouse  Push X  Pull V  Backspace restart",
             True, C.YELLOW), (10, C.HEIGHT - 28))
