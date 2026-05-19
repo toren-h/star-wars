@@ -793,20 +793,23 @@ def parkour_stage(which_map="old"):
     player_hp            = 3
     player_flash_until   = 0
     red_seq              = []   # tracks progress through R-E-D combo
-    gun_count         = 0
-    active_weapon     = 'saber'
-    last_gun_shot     = 0
-    last_bazooka_shot = 0
-    gun_pickups       = []
-    rockets           = []
-    GUN_COOLDOWN      = 500
-    BAZOOKA_COOLDOWN  = 1500
-    grenade_count     = 3
+    gun_count           = 0
+    active_weapon       = 'saber'
+    last_gun_shot       = 0
+    last_bazooka_shot   = 0
+    gun_pickups         = []
+    rockets             = []
+    bazooka_craft_start = None   # ms timestamp when M was pressed, or None
+    bazooka_ready       = False  # True once the 10s craft animation finishes
+    GUN_COOLDOWN        = 500
+    BAZOOKA_COOLDOWN    = 1500
+    BAZOOKA_CRAFT_MS    = 10000
+    grenade_count       = 3
     _request_restart_flag[0] = False
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, last_bazooka_shot, gun_pickups, rockets, grenade_count
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, last_bazooka_shot, gun_pickups, rockets, bazooka_craft_start, bazooka_ready, grenade_count
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -819,7 +822,7 @@ def parkour_stage(which_map="old"):
         saber_len = saber_target = float(C.SABER_LEN); saber_active = True; saber_color = C.CYAN; saber_switching = False
         lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
         player_hp = 3; player_flash_until = 0; red_seq.clear()
-        gun_count = 0; active_weapon = 'saber'; last_gun_shot = 0; last_bazooka_shot = 0; gun_pickups = []; rockets = []; grenade_count = 3
+        gun_count = 0; active_weapon = 'saber'; last_gun_shot = 0; last_bazooka_shot = 0; gun_pickups = []; rockets = []; bazooka_craft_start = None; bazooka_ready = False; grenade_count = 3
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
 
@@ -876,9 +879,11 @@ def parkour_stage(which_map="old"):
                 if e.key == pygame.K_3 and gun_count >= 1:
                     active_weapon = 'gun'
                     grenade_charge_start = None
-                if e.key == pygame.K_4 and gun_count >= 10:
+                if e.key == pygame.K_4 and bazooka_ready:
                     active_weapon = 'bazooka'
                     grenade_charge_start = None
+                if e.key == pygame.K_m and gun_count >= 10 and not bazooka_ready and bazooka_craft_start is None:
+                    bazooka_craft_start = pygame.time.get_ticks()
                 if e.key == pygame.K_BACKSPACE:
                     _request_restart_flag[0] = True; _death_pending_flag[0] = False
                 if e.key == pygame.K_ESCAPE:
@@ -1211,6 +1216,11 @@ def parkour_stage(which_map="old"):
 
         camx, camy = center_camera_on_player(camx, camy, player, ROWS, COLS)
 
+        if bazooka_craft_start is not None:
+            if pygame.time.get_ticks() - bazooka_craft_start >= BAZOOKA_CRAFT_MS:
+                bazooka_ready       = True
+                bazooka_craft_start = None
+
         for gp in gun_pickups:
             gp.update(ROWS, COLS, get_tile)
 
@@ -1339,6 +1349,32 @@ def parkour_stage(which_map="old"):
                                  (int(pcx_d + ux * 22), int(pcy_d + uy * 22)), 2)
         for gp in gun_pickups: gp.draw(display.screen, camx, camy)
         for rk in rockets: rk.draw(camx, camy)
+
+        if bazooka_craft_start is not None:
+            craft_elapsed = pygame.time.get_ticks() - bazooka_craft_start
+            craft_t = min(craft_elapsed / BAZOOKA_CRAFT_MS, 1.0)
+            pcx_cr = int(player.rect.centerx - camx)
+            pcy_cr = int(player.rect.centery - camy)
+            # orbiting sparks around the player
+            for i in range(8):
+                angle = (craft_elapsed / 400.0) + i * (math.pi / 4)
+                r_orb = 18 + 6 * math.sin(craft_elapsed / 300.0 + i)
+                sx_cr = int(pcx_cr + math.cos(angle) * r_orb)
+                sy_cr = int(pcy_cr + math.sin(angle) * r_orb)
+                spark_col = (255, int(80 + 140 * craft_t), 0)
+                pygame.draw.circle(display.screen, spark_col, (sx_cr, sy_cr), 3)
+            # progress bar above player
+            bar_w, bar_h = 80, 10
+            bx_cr = pcx_cr - bar_w // 2
+            by_cr = int(player.rect.top - camy) - 22
+            pygame.draw.rect(display.screen, (50, 30, 10),    (bx_cr, by_cr, bar_w, bar_h), border_radius=3)
+            pygame.draw.rect(display.screen, (220, 110, 20),  (bx_cr, by_cr, int(bar_w * craft_t), bar_h), border_radius=3)
+            pygame.draw.rect(display.screen, (255, 200, 80),  (bx_cr, by_cr, bar_w, bar_h), 1, border_radius=3)
+            # flashing label
+            if (craft_elapsed // 400) % 2 == 0:
+                lbl = display.FONT.render("CRAFTING BAZOOKA...", True, (255, 200, 60))
+                display.screen.blit(lbl, (pcx_cr - lbl.get_width() // 2, by_cr - 16))
+
         for s in siths: s.draw(display.screen, camx, camy)
         for lf in lava_flows: lf.draw(camx, camy)
         for g in grenades: g.draw(camx, camy)
@@ -1474,9 +1510,14 @@ def parkour_stage(which_map="old"):
             display.screen.blit(display.FONT.render("[3] GUN", True, gun_c), (280, 70))
         elif gun_pickups:
             display.screen.blit(display.FONT.render(f"[P] GUN ({gun_count}/10 BZOOKA)", True, (160, 160, 80)), (280, 70))
-        if gun_count >= 10:
+        if bazooka_ready:
             baz_c = C.WHITE if active_weapon == 'bazooka' else (200, 120, 40)
             display.screen.blit(display.FONT.render("[4] BAZOOKA", True, baz_c), (390, 70))
+        elif bazooka_craft_start is not None:
+            craft_pct = int(min((pygame.time.get_ticks() - bazooka_craft_start) / BAZOOKA_CRAFT_MS * 100, 100))
+            display.screen.blit(display.FONT.render(f"CRAFTING... {craft_pct}%", True, (220, 140, 30)), (390, 70))
+        elif gun_count >= 10:
+            display.screen.blit(display.FONT.render("[M] CRAFT BAZOOKA", True, (200, 160, 50)), (390, 70))
         elif gun_count >= 1:
             display.screen.blit(display.FONT.render(f"({gun_count}/10 BAZOOKA)", True, (120, 100, 40)), (390, 70))
         display.screen.blit(display.FONT.render(
