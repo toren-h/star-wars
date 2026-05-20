@@ -730,11 +730,19 @@ def draw_bolts(bolts, camx, camy):
         color = C.YELLOW if b.friendly else C.RED
         pygame.draw.circle(display.screen, color, (int(b.x - camx), int(b.y - camy)), b.r)
 
-def draw_player(p, camx, camy, p1, p2, saber_color=C.CYAN, flash=False):
+def draw_player(p, camx, camy, p1, p2, saber_color=C.CYAN, flash=False, is_sith=False):
     x, y = p.rect.x - camx, p.rect.y - camy
-    body_col = (255, 255, 255) if flash else C.BLUE
-    pygame.draw.rect(display.screen,  body_col,       (x, y, p.w, p.h), border_radius=5)
-    pygame.draw.rect(display.screen,  (230, 230, 255), (x + 6, y + 4, p.w - 12, 8), border_radius=3)
+    if flash:
+        body_col = (255, 255, 255)
+        head_col = (255, 255, 255)
+    elif is_sith:
+        body_col = C.RED
+        head_col = (255, 150, 150)
+    else:
+        body_col = C.BLUE
+        head_col = (230, 230, 255)
+    pygame.draw.rect(display.screen,  body_col, (x, y, p.w, p.h), border_radius=5)
+    pygame.draw.rect(display.screen,  head_col, (x + 6, y + 4, p.w - 12, 8), border_radius=3)
     pygame.draw.line(display.screen,  saber_color,
                      (int(p1[0] - camx), int(p1[1] - camy)),
                      (int(p2[0] - camx), int(p2[1] - camy)), C.SABER_THICKNESS)
@@ -792,7 +800,8 @@ def parkour_stage(which_map="old"):
     nuke_state           = None  # None | ('fuse', start_ms, x, y) | ('blast', start_ms, sparks)
     player_hp            = 3
     player_flash_until   = 0
-    red_seq              = []   # tracks progress through R-E-D combo
+    red_seq              = []
+    is_sith              = False
     gun_count           = 0
     active_weapon       = 'saber'
     last_gun_shot       = 0
@@ -809,7 +818,7 @@ def parkour_stage(which_map="old"):
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, last_bazooka_shot, gun_pickups, rockets, bazooka_craft_start, bazooka_ready, grenade_count
+        nonlocal level_grid, turrets, bolts, player, camx, camy, win, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, is_sith, gun_count, active_weapon, last_gun_shot, last_bazooka_shot, gun_pickups, rockets, bazooka_craft_start, bazooka_ready, grenade_count
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -821,7 +830,7 @@ def parkour_stage(which_map="old"):
         camx = camy = 0.0; win = False
         saber_len = saber_target = float(C.SABER_LEN); saber_active = True; saber_color = C.CYAN; saber_switching = False
         lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
-        player_hp = 3; player_flash_until = 0; red_seq.clear()
+        player_hp = 3; player_flash_until = 0; red_seq.clear(); is_sith = False
         gun_count = 0; active_weapon = 'saber'; last_gun_shot = 0; last_bazooka_shot = 0; gun_pickups = []; rockets = []; bazooka_craft_start = None; bazooka_ready = False; grenade_count = 3
         _request_restart_flag[0] = False; _death_pending_flag[0] = False
         return START, GOAL
@@ -842,20 +851,9 @@ def parkour_stage(which_map="old"):
                     saber_active = not saber_active
                 if e.key == pygame.K_x:   force_push(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
                 if e.key == pygame.K_v:   force_pull(player, bolts, turrets, ROWS, COLS, get_tile, set_tile)
-                # R-E-D sequence activates color switch
-                _RED_KEYS = [pygame.K_r, pygame.K_e, pygame.K_d]
-                _RED_TIMEOUT = 10000
                 if e.key == pygame.K_r:
-                    red_seq.clear()
-                    red_seq.append((pygame.K_r, pygame.time.get_ticks()))
-                elif e.key == pygame.K_e and red_seq and red_seq[-1][0] == pygame.K_r:
-                    if pygame.time.get_ticks() - red_seq[0][1] <= _RED_TIMEOUT:
-                        red_seq.append((pygame.K_e, pygame.time.get_ticks()))
-                elif e.key == pygame.K_d and len(red_seq) == 2 and red_seq[-1][0] == pygame.K_e:
-                    if pygame.time.get_ticks() - red_seq[0][1] <= _RED_TIMEOUT:
-                        saber_switching = True
-                        saber_target = 0.0
-                    red_seq.clear()
+                    is_sith = not is_sith
+                    saber_color = C.RED if is_sith else C.CYAN
                 if e.key == pygame.K_z and nuke_state is None and saber_color == C.RED:
                     nuke_state = ('phone', pygame.time.get_ticks(), float(player.rect.centerx))
                 if e.key == pygame.K_g and saber_color == C.RED:
@@ -1018,7 +1016,8 @@ def parkour_stage(which_map="old"):
         saber_p2 = (pcx + ux * saber_len, pcy + uy * saber_len)
 
         for s in siths:
-            s.update(player, ROWS, COLS, get_tile)
+            if not is_sith:
+                s.update(player, ROWS, COLS, get_tile)
 
         # Two 8-px-thick sabers visually overlap when their centrelines are within
         # SABER_THICKNESS px of each other (4 px half-thickness each side).
@@ -1070,7 +1069,7 @@ def parkour_stage(which_map="old"):
                 if s.take_hit():
                     siths.remove(s); continue
 
-            if s in siths and not sabers_clash and s.check_hit_on_player(player):
+            if s in siths and not is_sith and not sabers_clash and s.check_hit_on_player(player):
                 player_hp -= 1
                 player_flash_until = pygame.time.get_ticks() + 350
                 s.state = 'recover'; s.state_start = pygame.time.get_ticks()
@@ -1087,7 +1086,8 @@ def parkour_stage(which_map="old"):
         for t in turrets[:]: t.check_support_and_maybe_fall(ROWS, COLS, get_tile)
         for t in turrets[:]:
             if t.update_fall(ROWS, COLS, get_tile, set_tile): turrets.remove(t)
-        for t in turrets[:]: t.update_and_maybe_shoot(player, bolts, ROWS, COLS, get_tile)
+        if not is_sith:
+            for t in turrets[:]: t.update_and_maybe_shoot(player, bolts, ROWS, COLS, get_tile)
         for b in bolts:
             if b.alive: b.update(ROWS, COLS, get_tile)
 
@@ -1316,7 +1316,8 @@ def parkour_stage(which_map="old"):
         draw_bolts(bolts, camx, camy)
         draw_player(player, camx, camy, saber_p1,
                     saber_p1 if active_weapon in ('gun', 'grenade', 'bazooka') else saber_p2,
-                    saber_color, flash=pygame.time.get_ticks() < player_flash_until)
+                    saber_color, flash=pygame.time.get_ticks() < player_flash_until,
+                    is_sith=is_sith)
         if active_weapon == 'grenade' and grenade_count > 0:
             hx = int(player.rect.centerx - camx) + player.face_dir * 14
             hy = int(player.rect.centery  - camy) + 6
