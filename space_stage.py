@@ -598,7 +598,7 @@ def space_stage():
         for tp in torpedoes:   tp.draw(display.screen)
         xwing.draw(display.screen)
 
-        hud = (f"Turn ←/→  Thrust ↑  Shoot SPACE  Torpedo T [{torpedo_count}]  Free Torpedo V  (fly into green hangar to land)"
+        hud = (f"Turn ←/→  Thrust ↑  Shoot SPACE  Torpedo T [{torpedo_count}]  (fly into green hangar to land)"
                if STATE == "combat"
                else "Systems failing... small control (←/→ rotate, ↑ thrust). Falling to planet...")
         display.screen.blit(display.FONT.render(hud, True, C.WHITE),
