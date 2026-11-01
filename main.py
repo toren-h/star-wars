@@ -9,7 +9,7 @@ if __name__ == "__main__":
         if result == "space_dead":
             continue
         elif result == "landed_destroyer":
-            parkour_stage("old")
+            parkour_stage("old")  
         elif result == "planet_touch":
             parkour_stage("new")
         pygame.quit()

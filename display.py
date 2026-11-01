@@ -8,11 +8,7 @@ clock  = pygame.time.Clock()
 FONT   = pygame.font.SysFont("consolas", 18)
 BIG    = pygame.font.SysFont("consolas", 28)
 
-TIME_SCALE = 1.00
-
-def toggle_slow():
-    global TIME_SCALE
-    TIME_SCALE = C.TIME_SLOW if abs(TIME_SCALE - 1.00) < 1e-6 else 1.00
+TIME_SCALE = 0.75 * 1.00 + 0.25 * C.TIME_SLOW   # 75% fast, 25% slow (~0.86)
 
 def fade_to_black():
     fade = pygame.Surface((C.WIDTH, C.HEIGHT))
