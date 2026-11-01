@@ -157,3 +157,37 @@ def _make_lightning(p1, p2, segments=10, jitter=14):
         pts.append((mx, my))
     pts.append(p2)
     return pts
+
+# ---- Wall raycasting (sniper scope, line-of-sight checks) ----
+def raycast_wall_distance(px, py, ux, uy, max_dist, ROWS, COLS, get_tile, step=None):
+    """March a ray from (px, py) in unit direction (ux, uy) and return the
+    distance at which it first enters a wall ('X') tile or the map edge, or
+    max_dist if it never does."""
+    if step is None:
+        step = C.TILE / 2
+    dist = 0.0
+    while dist < max_dist:
+        dist = min(dist + step, max_dist)
+        wx, wy = px + ux * dist, py + uy * dist
+        r, c = int(wy) // C.TILE, int(wx) // C.TILE
+        if not (0 <= r < ROWS and 0 <= c < COLS) or get_tile(r, c) == 'X':
+            return max(0.0, dist - step)
+    return max_dist
+
+def has_line_of_sight(x1, y1, x2, y2, ROWS, COLS, get_tile, step=None):
+    """True if the straight segment from (x1,y1) to (x2,y2) doesn't pass
+    through any wall ('X') tile."""
+    if step is None:
+        step = C.TILE / 2
+    dist = math.hypot(x2 - x1, y2 - y1)
+    if dist < 1e-6:
+        return True
+    ux, uy = (x2 - x1) / dist, (y2 - y1) / dist
+    d = 0.0
+    while d < dist:
+        d = min(d + step, dist)
+        wx, wy = x1 + ux * d, y1 + uy * d
+        r, c = int(wy) // C.TILE, int(wx) // C.TILE
+        if not (0 <= r < ROWS and 0 <= c < COLS) or get_tile(r, c) == 'X':
+            return False
+    return True

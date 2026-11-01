@@ -198,7 +198,7 @@ class Turret:
         self.push_vx    = 0.0
         self.push_sub   = 0.0
         self.stun_until = 0
-        self.mg_hits    = 0
+        self.hit_count  = 0   # hits taken from a multi-hit weapon (e.g. shotgun pellets)
 
     def center(self):
         return (self.rect.centerx, self.rect.centery)
@@ -434,17 +434,23 @@ class LavaFlow:
 
 
 class Bolt:
-    def __init__(self, x, y, vx, vy):
+    def __init__(self, x, y, vx, vy, max_range_tiles=None):
         self.x  = float(x); self.y  = float(y)
         self.vx = float(vx); self.vy = float(vy)
         self.r  = 4; self.alive = True; self.friendly = False
         self.prev_x = self.x; self.prev_y = self.y
         self.enemy_penetrating = False  # passes through enemies without stopping
         self.tasing           = False  # stuns instead of kills
-        self.mg_bolt          = False  # machine-gun bolt; turrets need 3 hits
+        self.multi_hit        = False  # needs several hits to down a turret (e.g. shotgun pellets)
         self.one_shot         = False  # kills any enemy in one hit
         self.wide             = False  # taser wide-beam: 2-tile-tall hitbox
         self.hit_ids          = set()  # enemy ids already hit
+        # Short-range bolts (shotgun, double gun) fizzle out after travelling
+        # this many tiles instead of flying the length of the level.
+        self.spawn_x    = self.x
+        self.spawn_y    = self.y
+        self.max_range  = (max_range_tiles * C.TILE) if max_range_tiles else None
+        self.expired    = False  # set True when range runs out (vs. hitting a wall/enemy)
 
     def rect(self):
         if self.wide:
@@ -460,6 +466,9 @@ class Bolt:
         if (self.x < -10 or self.x > COLS * C.TILE + 10 or
                 self.y < -10 or self.y > ROWS * C.TILE + 10):
             self.alive = False; return
+        if self.max_range is not None:
+            if (self.x - self.spawn_x) ** 2 + (self.y - self.spawn_y) ** 2 >= self.max_range ** 2:
+                self.alive = False; self.expired = True; return
         r, c = int(self.y) // C.TILE, int(self.x) // C.TILE
         if 0 <= r < ROWS and 0 <= c < COLS and get_tile(r, c) == 'X':
             self.alive = False

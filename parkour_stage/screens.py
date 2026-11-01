@@ -139,7 +139,7 @@ def character_select():
 
 
 # ---- Shop (hub screen after clearing all Sith Lords) ----
-GUN_NAMES = {'dual': 'DOUBLE GUN', 'machinegun': 'MACHINE GUN', 'dualblaster': 'DUAL BLASTER',
+GUN_NAMES = {'dual': 'DOUBLE GUN', 'shotgun': 'SHOTGUN', 'dualblaster': 'DUAL BLASTER',
              'sniper': 'SNIPER RIFLE', 'raygun': 'RAY GUN', 'penetrator': 'PENETRATOR'}
 
 def shop_screen(coins, character, gun_type, saber_color, player, player_hp, progress):
@@ -149,25 +149,35 @@ def shop_screen(coins, character, gun_type, saber_color, player, player_hp, prog
     `progress` is a dict mutated in place holding everything that must
     survive an in-stage death/restart: sword_bought, bonus_hits,
     bonus_max_health, jetpack_bought, barrier_bought, bird_ammo,
-    owned_guns (list), gun_count. Mutates player.health/max_health in
-    place. Returns (coins, gun_type, saber_color, player_hp)."""
+    rocket_ammo_manual, rocket_ammo_homing, owned_guns (list), gun_count.
+    Mutates player.health/max_health in place. Returns (coins, gun_type,
+    saber_color, player_hp)."""
     selected = 0
     while True:
-        items = [('gun', gt, name, C.SHOP_GUN_PRICE)
+        # Trooper and Mandalorian each picked/carry one fixed gun and keep it
+        # for the whole level, so the shop doesn't offer any others.
+        items = ([('gun', gt, name, C.SHOP_GUN_PRICE)
                   for gt, name in GUN_NAMES.items() if gt not in progress['owned_guns']]
+                 if character not in ('trooper', 'mandalorian') else [])
         if character == 'jedi' and not progress['sword_bought']:
             items.append(('sword', None, 'RED LIGHTSABER', C.SHOP_SWORD_PRICE))
         if player.max_health is not None:
             items.append(('shield', None, f'ARMOR PLATING (+{C.SHOP_SHIELD_HEALTH_BONUS} Max HP)', C.SHOP_SHIELD_PRICE))
         else:
             items.append(('shield', None, 'SITH RESIST (+1 Hit)', C.SHOP_SHIELD_PRICE))
-        if character != 'mandalorian' and not progress['jetpack_bought']:
-            items.append(('jetpack', None, 'JETPACK (Space = flamethrower)', C.SHOP_JETPACK_PRICE))
+        if not progress['jetpack_bought']:
+            # Mandalorian's jetpack/flamethrower costs far more than anyone
+            # else's plain flight jetpack.
+            _jetpack_price = 5000 if character == 'mandalorian' else C.SHOP_JETPACK_PRICE
+            items.append(('jetpack', None, 'JETPACK (hold E to fly, unlimited)', _jetpack_price))
         if not progress['barrier_bought']:
             items.append(('barrier', None, 'RIOT SHIELD (hold C)', C.SHOP_BARRIER_PRICE))
         if character == 'mandalorian':
             items.append(('birds', None, f"WHISTLING BIRD (have {progress['bird_ammo']})", C.SHOP_BIRDS_PRICE))
-            items.append(('rocket', None, f"ROCKET ROUND (have {progress['rocket_ammo']})", C.SHOP_ROCKET_PRICE))
+            items.append(('rocket_manual', None,
+                          f"ROCKET: SELF-DESTRUCT (have {progress['rocket_ammo_manual']})", C.SHOP_ROCKET_PRICE))
+            items.append(('rocket_homing', None,
+                          f"ROCKET: HOMING (have {progress['rocket_ammo_homing']})", C.SHOP_ROCKET_PRICE))
         items.append(('leave', None, 'LEAVE SHOP', 0))
         n = len(items)
         selected = max(0, min(selected, n - 1))
@@ -201,8 +211,10 @@ def shop_screen(coins, character, gun_type, saber_color, player, player_hp, prog
                     progress['barrier_bought'] = True
                 elif kind == 'birds':
                     progress['bird_ammo'] += 1
-                elif kind == 'rocket':
-                    progress['rocket_ammo'] += 1
+                elif kind == 'rocket_manual':
+                    progress['rocket_ammo_manual'] += 1
+                elif kind == 'rocket_homing':
+                    progress['rocket_ammo_homing'] += 1
             return False
 
         box_w, box_h = 360, 44
@@ -315,3 +327,140 @@ def hub_screen(coins, character, gun_type, saber_color, player, player_hp, progr
         pygame.display.flip()
 
 
+
+
+# ---- Trooper gun select (reached from the home screen) ----
+TROOPER_GUNS = ['dual', 'shotgun', 'sniper']
+_TROOPER_GUN_BLURBS = {
+    'dual':       ['Fast single shots', 'Every 4th shot: 0.5s rest'],
+    'shotgun':    ['5-pellet close-range spread', 'Takes 3 pellets to drop a turret'],
+    'sniper':     ['Zoom scope (hold Z)', 'Two-shot volley, then a long rest'],
+}
+
+def gun_select_screen(current_gun):
+    """Pick the one gun Trooper will carry for the whole level — this is
+    only reachable from the home screen; there's no changing it mid-level.
+    Returns the chosen gun key."""
+    keys_map = TROOPER_GUNS
+    selected = keys_map.index(current_gun) if current_gun in keys_map else 0
+    box_w, box_h = 240, 170
+    gap = 30
+    total_w = 3 * box_w + 2 * gap
+    start_x = C.WIDTH  // 2 - total_w // 2
+    start_y = C.HEIGHT // 2 - box_h  // 2
+    boxes = [pygame.Rect(start_x + i * (box_w + gap), start_y, box_w, box_h) for i in range(3)]
+    while True:
+        display.clock.tick(60)
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_LEFT, pygame.K_a):
+                    selected = (selected - 1) % 3
+                elif e.key in (pygame.K_RIGHT, pygame.K_d):
+                    selected = (selected + 1) % 3
+                elif e.key == pygame.K_RETURN:
+                    return keys_map[selected]
+                elif e.key == pygame.K_ESCAPE:
+                    return keys_map[selected]
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                for i, rect in enumerate(boxes):
+                    if rect.collidepoint(e.pos):
+                        return keys_map[i]
+            elif e.type == pygame.MOUSEMOTION:
+                for i, rect in enumerate(boxes):
+                    if rect.collidepoint(e.pos):
+                        selected = i
+        display.screen.fill((8, 8, 18))
+        title = display.BIG.render("CHOOSE YOUR GUN", True, C.WHITE)
+        display.screen.blit(title, (C.WIDTH // 2 - title.get_width() // 2, 80))
+        for i, gkey in enumerate(keys_map):
+            rect = boxes[i]
+            bx, by = rect.x, rect.y
+            fill_col   = (25, 25, 45) if i == selected else (15, 15, 30)
+            border_col = C.CYAN       if i == selected else (60, 60, 80)
+            border_w   = 3            if i == selected else 1
+            pygame.draw.rect(display.screen, fill_col,   rect, border_radius=10)
+            pygame.draw.rect(display.screen, border_col, rect, border_w, border_radius=10)
+            ns = display.FONT.render(GUN_NAMES[gkey], True, C.CYAN if i == selected else C.WHITE)
+            display.screen.blit(ns, (bx + box_w // 2 - ns.get_width() // 2, by + 22))
+            for j, line in enumerate(_TROOPER_GUN_BLURBS[gkey]):
+                ls = display.FONT.render(line, True, (180, 180, 210))
+                display.screen.blit(ls, (bx + box_w // 2 - ls.get_width() // 2, by + 86 + j * 22))
+        hint = display.FONT.render("← → or hover to choose    ENTER or click to confirm    ESC = keep current", True, (100, 100, 130))
+        display.screen.blit(hint, (C.WIDTH // 2 - hint.get_width() // 2, C.HEIGHT - 70))
+        pygame.display.flip()
+
+
+# ---- Home screen (shown at launch: PLAY, pick your gun, or change colours) ----
+def home_screen(bg_color, fog_color, trooper_gun='dual'):
+    """The title screen shown when the game first launches, in the same
+    style as hub_screen. PLAY starts the game (space stage, then whichever
+    parkour stage is reached); GUN opens gun_select_screen to choose the
+    one gun Trooper will carry for the whole level (can't be changed once
+    you're in a level); COLOURS opens the same colour picker used in-level,
+    letting the background/shadow colours be set up front.
+    Returns (bg_color, fog_color, trooper_gun) once PLAY is chosen."""
+    selected = 0
+    labels = ['PLAY', 'GUN', 'COLOURS']
+    box_w, box_h = 220, 80
+    gap = 24
+    total_w = 3 * box_w + 2 * gap
+    start_x = C.WIDTH  // 2 - total_w // 2
+    start_y = C.HEIGHT // 2 - box_h  // 2
+    boxes = [pygame.Rect(start_x + i * (box_w + gap), start_y, box_w, box_h) for i in range(3)]
+    while True:
+        display.clock.tick(60)
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            elif e.type == pygame.KEYDOWN:
+                if e.key in (pygame.K_LEFT, pygame.K_a):
+                    selected = (selected - 1) % 3
+                elif e.key in (pygame.K_RIGHT, pygame.K_d):
+                    selected = (selected + 1) % 3
+                elif e.key == pygame.K_RETURN:
+                    if labels[selected] == 'PLAY':
+                        return bg_color, fog_color, trooper_gun
+                    elif labels[selected] == 'GUN':
+                        trooper_gun = gun_select_screen(trooper_gun)
+                    else:
+                        bg_color, fog_color, _quit = color_picker(bg_color, fog_color)
+                        if _quit: pygame.quit(); sys.exit()
+                elif e.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                for i, rect in enumerate(boxes):
+                    if rect.collidepoint(e.pos):
+                        if labels[i] == 'PLAY':
+                            return bg_color, fog_color, trooper_gun
+                        elif labels[i] == 'GUN':
+                            trooper_gun = gun_select_screen(trooper_gun)
+                        else:
+                            bg_color, fog_color, _quit = color_picker(bg_color, fog_color)
+                            if _quit: pygame.quit(); sys.exit()
+            elif e.type == pygame.MOUSEMOTION:
+                for i, rect in enumerate(boxes):
+                    if rect.collidepoint(e.pos):
+                        selected = i
+        display.screen.fill((8, 8, 18))
+        title = display.BIG.render("STAR WARS QUEST", True, C.WHITE)
+        display.screen.blit(title, (C.WIDTH // 2 - title.get_width() // 2, 90))
+        swatch = pygame.Rect(C.WIDTH // 2 - 100, 150, 200, 34)
+        pygame.draw.rect(display.screen, bg_color, swatch, border_radius=6)
+        pygame.draw.rect(display.screen, C.WHITE, swatch, 1, border_radius=6)
+        swatch_lbl = display.FONT.render("background colour", True, (180, 180, 210))
+        display.screen.blit(swatch_lbl, (C.WIDTH // 2 - swatch_lbl.get_width() // 2, 190))
+        gun_lbl = display.FONT.render(f"Trooper gun: {GUN_NAMES[trooper_gun]}", True, (180, 220, 255))
+        display.screen.blit(gun_lbl, (C.WIDTH // 2 - gun_lbl.get_width() // 2, 212))
+        for i, label in enumerate(labels):
+            rect = boxes[i]
+            fill_col   = (25, 45, 25) if i == selected else (15, 15, 30)
+            border_col = (90, 220, 120) if i == selected else (60, 60, 80)
+            pygame.draw.rect(display.screen, fill_col,   rect, border_radius=10)
+            pygame.draw.rect(display.screen, border_col, rect, 3, border_radius=10)
+            lbl = display.BIG.render(label, True, C.WHITE)
+            display.screen.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery - lbl.get_height() // 2))
+        hint = display.FONT.render("← → or hover to choose    ENTER or click to confirm    ESC quit", True, (100, 100, 130))
+        display.screen.blit(hint, (C.WIDTH // 2 - hint.get_width() // 2, C.HEIGHT - 70))
+        pygame.display.flip()

@@ -8,6 +8,7 @@ from .geometry import (
     rect_for_tile, bfs_tile_path, normalize_and_floor, scan_entities, tiles_at,
     point_seg_dist_sq, seg_intersect, seg_intersect_point, _saber_clip_at_zone,
     seg_intersects_rect, _make_lightning, SCOPE_RANGE_TILES,
+    raycast_wall_distance, has_line_of_sight,
 )
 from .forces import _within_force_line, _slide_turret_horiz, force_push, force_pull
 from .state import _request_restart_flag, _death_pending_flag
@@ -18,9 +19,12 @@ from .draw import (
 from .screens import color_picker, character_select, shop_screen, hub_screen, GUN_NAMES
 
 # ---- Stage ----
-def parkour_stage(which_map="old"):
+def parkour_stage(which_map="old", bg_color=None, fog_color=None, trooper_gun='dual'):
     character        = character_select()
-    gun_type         = 'dual' if character in ('trooper', 'mandalorian') else None  # free starting gun, no pick screen
+    # Trooper's gun is chosen once on the home screen and can't be changed
+    # mid-level; Mandalorian always carries a plain, no-frills blaster.
+    gun_type         = (trooper_gun if character == 'trooper' else
+                         'blaster' if character == 'mandalorian' else None)
     base             = OLD_LEVEL if which_map == "old" else NEW_LEVEL
     LEVEL, ROWS, COLS = normalize_and_floor(base)
     level_grid       = [list(row) for row in LEVEL]
@@ -57,6 +61,7 @@ def parkour_stage(which_map="old"):
     grenade_charge_start = None
     last_lightning_t     = 0
     float_accum          = 0.0
+    jetpack_float_accum  = 0.0
     nuke_state           = None  # None | ('fuse', start_ms, x, y) | ('blast', start_ms, sparks)
     player_hp            = 3
     player_flash_until   = 0
@@ -67,7 +72,11 @@ def parkour_stage(which_map="old"):
     gun_pickups         = []
     GUN_COOLDOWN        = 500
     def _cooldown_for(gt):
-        return {'dual': 600, 'machinegun': 90, 'dualblaster': 380,
+        # 'dual' is intentionally very fast (rapid bang-bang-bang, every 4th
+        # shot followed by a brief rest); 'sniper' fires its two-shot volley
+        # with no gap between the two bolts, then rests before the next one;
+        # 'shotgun' is a slower pump between 5-pellet blasts.
+        return {'dual': 140, 'shotgun': 700, 'blaster': 350, 'dualblaster': 380,
                 'sniper': 900, 'raygun': 500, 'penetrator': 650}.get(gt, GUN_COOLDOWN)
     grenade_count       = 3
     force_spark         = 100.0
@@ -84,14 +93,17 @@ def parkour_stage(which_map="old"):
     jetpack_fuel     = JETPACK_FUEL_MAX
     grapple          = None  # None or {'x','y','vx','vy','attached'}
     flame_particles  = []   # list of {'x','y','vx','vy','life','max_life','col'}
-    bg_color         = C.GREEN
-    fog_color        = (0, 0, 0)
+    bg_color         = bg_color if bg_color is not None else C.GREEN
+    fog_color        = fog_color if fog_color is not None else (0, 0, 0)
     taser_mode       = False
     coins            = 0      # persists across in-stage deaths/restarts
     _l_coin_acc      = 0.0    # fractional-second accumulator for the L-key coin cheat
     whistling_birds  = []     # list of {'x','y','vx','vy','target','life'}
     _last_birds_t    = -999999  # cooldown timestamp for Whistling Birds
-    rockets          = []     # list of {'x','y','vx','vy','life'} — only one in flight at a time
+    # 'kind' is 'manual' (self-destruct, A/D steered, pilot view) or
+    # 'homing' (auto-aims, but only while it has line of sight on a target)
+    # — only one rocket (of either kind) is ever in flight at a time.
+    rockets          = []     # list of {'x','y','vx','vy','kind','born'}
     _last_rocket_t   = -999999  # cooldown timestamp for Rocket Rounds
     # Everything here must survive an in-stage death/restart (Player and most
     # locals get recreated/reset by restart_run, so this dict is the one
@@ -102,15 +114,19 @@ def parkour_stage(which_map="old"):
         'bonus_max_health': 0,
         'jetpack_bought':   False,
         'barrier_bought':   False,
-        'bird_ammo':        0,
-        'rocket_ammo':      0,
+        'bird_ammo':          0,
+        'rocket_ammo_manual': 0,   # self-destruct, A/D-steered rocket
+        'rocket_ammo_homing': 0,   # auto-aims, but only with line of sight
+        # Trooper picked this one gun on the home screen and is stuck with
+        # it for the whole level — no shop purchases, no switching.
         'owned_guns':       [gun_type] if gun_type else [],
         'gun_count':        1 if character in ('trooper', 'mandalorian') else 0,
     }
-    _gun_cooldown    = _cooldown_for(gun_type)
-    mg_phase_start   = pygame.time.get_ticks()  # start of current MG 5s fire / 2s pause cycle
-    _dg_burst        = 0    # double-gun burst state: 0=ready, 1=first shot fired, 2=cooldown
-    _dg_burst_start  = 0    # ms timestamp when burst began
+    _gun_cooldown      = _cooldown_for(gun_type)
+    # Double gun fires fast, but every 4th shot is followed by a brief,
+    # silent rest (no HUD countdown) before the next one.
+    _dual_burst_count  = 0
+    _dual_rest_until   = 0
     sniper_scoping   = False  # True when Z held with sniper rifle
     _scope_dist      = 0.0   # how far along the laser the scope has drifted (px)
     if character in ('trooper', 'mandalorian'):
@@ -124,7 +140,7 @@ def parkour_stage(which_map="old"):
     _death_pending_flag[0]   = False
 
     def restart_run():
-        nonlocal level_grid, turrets, bolts, player, camx, camy, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, gun_pickups, grenade_count, force_spark, force_tick_acc, jetpack_fuel, grapple, flame_particles, taser_mode, mg_phase_start, _dg_burst, _dg_burst_start, sniper_scoping, _scope_dist, _fall_peak_y, _was_on_ground, whistling_birds, _last_birds_t, rockets, _last_rocket_t
+        nonlocal level_grid, turrets, bolts, player, camx, camy, siths, saber_len, saber_target, saber_active, saber_color, saber_switching, lightnings, grenades, lava_flows, explosions, crumbling_effects, grenade_charge_start, last_lightning_t, float_accum, jetpack_float_accum, nuke_state, player_hp, player_flash_until, gun_count, active_weapon, last_gun_shot, gun_pickups, grenade_count, force_spark, force_tick_acc, jetpack_fuel, grapple, flame_particles, taser_mode, _dual_burst_count, _dual_rest_until, sniper_scoping, _scope_dist, _fall_peak_y, _was_on_ground, whistling_birds, _last_birds_t, rockets, _last_rocket_t
         level_grid = [list(row) for row in LEVEL]
         START, GOAL, sp, sps = scan_entities(level_grid, ROWS, COLS)
         siths = [SithLord(c * C.TILE, r * C.TILE) for (r, c) in sps]
@@ -139,13 +155,13 @@ def parkour_stage(which_map="old"):
         saber_len = saber_target = float(C.SABER_LEN); saber_active = True
         saber_color = C.CYAN  # never start a life already in red/Sith mode, even if it was bought
         saber_switching = False
-        lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; nuke_state = None
+        lightnings = []; grenades = []; lava_flows = []; explosions = []; crumbling_effects = []; grenade_charge_start = None; last_lightning_t = 0; float_accum = 0.0; jetpack_float_accum = 0.0; nuke_state = None
         player_hp = 3 + progress['bonus_hits']; player_flash_until = 0; red_seq.clear()
         gun_count = 0; active_weapon = 'saber'; last_gun_shot = 0; gun_pickups = []; grenade_count = 3; force_spark = FORCE_SPARK_MAX; force_tick_acc = 0.0
         jetpack_fuel = JETPACK_FUEL_MAX; grapple = None; flame_particles = []; whistling_birds = []; _last_birds_t = -999999
         rockets = []; _last_rocket_t = -999999
-        taser_mode = False; mg_phase_start = pygame.time.get_ticks()
-        _dg_burst = 0; _dg_burst_start = 0; sniper_scoping = False; _scope_dist = 0.0
+        taser_mode = False; _dual_burst_count = 0; _dual_rest_until = 0
+        sniper_scoping = False; _scope_dist = 0.0
         if character in ('trooper', 'mandalorian'):
             gun_count = 1; active_weapon = 'gun'; saber_len = 0.0; saber_target = 0.0
         if progress['owned_guns']:
@@ -270,11 +286,32 @@ def parkour_stage(which_map="old"):
                             'target': _btarget, 'life': C.BIRDS_LIFE_FRAMES,
                             'path': _bpath, 'path_idx': 0,
                         })
-                if (e.key == pygame.K_n and character == 'mandalorian' and progress['rocket_ammo'] > 0
+                # N = self-destruct rocket: manually steered with A/D the whole
+                # flight, freezes the character (normal third-person view —
+                # you're watching it fly, not seeing through it), and it
+                # self-destructs after 20s in the air if it hits nothing.
+                if (e.key == pygame.K_n and character == 'mandalorian' and progress['rocket_ammo_manual'] > 0
                         and not rockets
                         and pygame.time.get_ticks() - _last_rocket_t >= C.ROCKET_COOLDOWN_MS):
                     _last_rocket_t = pygame.time.get_ticks()
-                    progress['rocket_ammo'] -= 1
+                    progress['rocket_ammo_manual'] -= 1
+                    _rpcx, _rpcy = float(player.rect.centerx), float(player.rect.centery)
+                    _rang = 0.0 if player.face_dir > 0 else math.pi
+                    rockets.append({
+                        'x': _rpcx, 'y': _rpcy, 'kind': 'manual',
+                        'vx': math.cos(_rang) * C.ROCKET_SPEED, 'vy': math.sin(_rang) * C.ROCKET_SPEED,
+                        'born': pygame.time.get_ticks(),
+                    })
+                # H = homing rocket: auto-aims at the nearest enemy, but only
+                # while it has a clear line of sight to it (otherwise it just
+                # flies straight until it does, or expires). Freezes the
+                # character and the camera rides with the rocket — you see
+                # out of it while it's in flight.
+                if (e.key == pygame.K_h and character == 'mandalorian' and progress['rocket_ammo_homing'] > 0
+                        and not rockets
+                        and pygame.time.get_ticks() - _last_rocket_t >= C.ROCKET_COOLDOWN_MS):
+                    _last_rocket_t = pygame.time.get_ticks()
+                    progress['rocket_ammo_homing'] -= 1
                     _rpcx, _rpcy = float(player.rect.centerx), float(player.rect.centery)
                     _rtargets = list(turrets) + list(siths)
                     if _rtargets:
@@ -284,7 +321,7 @@ def parkour_stage(which_map="old"):
                     else:
                         _rang = 0.0 if player.face_dir > 0 else math.pi
                     rockets.append({
-                        'x': _rpcx, 'y': _rpcy,
+                        'x': _rpcx, 'y': _rpcy, 'kind': 'homing',
                         'vx': math.cos(_rang) * C.ROCKET_SPEED, 'vy': math.sin(_rang) * C.ROCKET_SPEED,
                         'life': C.ROCKET_LIFE_FRAMES,
                     })
@@ -344,7 +381,16 @@ def parkour_stage(which_map="old"):
 
         keys = pygame.key.get_pressed()
         ts   = display.TIME_SCALE
-        _has_jetpack = character == 'mandalorian' or progress['jetpack_bought']
+        # While any rocket is in flight, the character doesn't move at all —
+        # for the self-destruct one you're busy steering it with A/D anyway,
+        # and for the homing one the camera itself is off watching it fly.
+        _piloting_rocket = bool(rockets)
+        # Flamethrower and jetpack are two separate things now: Mandalorian
+        # always has the flamethrower (Space) for free; the purchasable
+        # jetpack (E) is real, unlimited vertical flight, for whoever buys
+        # it (not Jedi — E is already their R-E-D saber-unlock key).
+        _has_flamethrower = character == 'mandalorian'
+        _has_jetpack = progress['jetpack_bought'] and character != 'jedi'
         _pushing = keys[pygame.K_x] and force_spark > 0 and character == 'jedi'
         _pulling = keys[pygame.K_v] and force_spark > 0 and character == 'jedi'
         _force_held = _pushing or _pulling
@@ -375,7 +421,13 @@ def parkour_stage(which_map="old"):
         else:
             # pre-cancel gravity so player.update() produces zero net downward movement
             player.vy = -C.GRAVITY * ts
-        if _has_jetpack and keys[pygame.K_SPACE] and jetpack_fuel > 0:
+        # Jetpack (E): real vertical flight, unlimited — no fuel cost at all.
+        jetpack_flying = _has_jetpack and keys[pygame.K_e]
+        if not jetpack_flying:
+            jetpack_float_accum = 0.0
+        else:
+            player.vy = -C.GRAVITY * ts  # pre-cancel gravity, same trick as the Jedi float
+        if _has_flamethrower and keys[pygame.K_SPACE] and jetpack_fuel > 0:
             jetpack_fuel = max(0.0, jetpack_fuel - FLAME_DRAIN * dt / 1000.0)
             _fmx, _fmy = pygame.mouse.get_pos()
             _fpcx = float(player.rect.centerx); _fpcy = float(player.rect.centery)
@@ -389,7 +441,8 @@ def parkour_stage(which_map="old"):
                 flame_particles.append({'x': _fpcx, 'y': _fpcy,
                                         'vx': math.cos(_ang)*_spd, 'vy': math.sin(_ang)*_spd,
                                         'life': 22, 'max_life': 22, 'col': _col})
-        player.update(keys, dt, ROWS, COLS, get_tile)
+        if not _piloting_rocket:
+            player.update(keys, dt, ROWS, COLS, get_tile)
 
         if player.max_health is not None:
             if player.on_ground:
@@ -404,6 +457,20 @@ def parkour_stage(which_map="old"):
             _was_on_ground = player.on_ground
             if player.health <= 0:
                 _request_restart_flag[0] = True; _death_pending_flag[0] = True
+
+        if jetpack_flying:
+            jetpack_float_accum += dt * ts * (C.TILE * 1.5 / 1000.0)
+            rise = int(jetpack_float_accum)
+            jetpack_float_accum -= rise
+            player.rect.y -= rise
+            for (r, c, ch) in tiles_at(player.rect, ROWS, COLS, get_tile):
+                if ch == 'X':
+                    t = rect_for_tile(r, c)
+                    if player.rect.colliderect(t):
+                        player.rect.top = t.bottom
+                        jetpack_float_accum = 0.0
+                        break
+            player.vy = 0
 
         if floating_now:
             float_accum += dt * ts * (C.TILE * 1.5 / 1000.0)
@@ -500,18 +567,27 @@ def parkour_stage(which_map="old"):
                 bd['life'] -= 1
                 _target = bd['target']
                 _target_alive = _target is not None and (_target in turrets or _target in siths)
-                _path = bd['path']; _pidx = bd['path_idx']
-                _aim_x = _aim_y = None
-                while _pidx < len(_path):
-                    _wx, _wy = _path[_pidx]
-                    if math.hypot(_wx - bd['x'], _wy - bd['y']) <= C.TILE * 0.6:
-                        _pidx += 1
-                        continue
-                    _aim_x, _aim_y = _wx, _wy
-                    break
-                bd['path_idx'] = _pidx
-                if _aim_x is None and _target_alive:
+                # Auto-aims straight at the target whenever it currently has
+                # a clear line of sight to it; otherwise it keeps following
+                # the path it worked out at launch (so it still finds its
+                # way around corners instead of just flying dumbly straight).
+                _bird_los = _target_alive and has_line_of_sight(
+                    bd['x'], bd['y'], _target.rect.centerx, _target.rect.centery, ROWS, COLS, get_tile)
+                if _bird_los:
                     _aim_x, _aim_y = _target.rect.centerx, _target.rect.centery
+                else:
+                    _path = bd['path']; _pidx = bd['path_idx']
+                    _aim_x = _aim_y = None
+                    while _pidx < len(_path):
+                        _wx, _wy = _path[_pidx]
+                        if math.hypot(_wx - bd['x'], _wy - bd['y']) <= C.TILE * 0.6:
+                            _pidx += 1
+                            continue
+                        _aim_x, _aim_y = _wx, _wy
+                        break
+                    bd['path_idx'] = _pidx
+                    if _aim_x is None and _target_alive:
+                        _aim_x, _aim_y = _target.rect.centerx, _target.rect.centery
                 if _aim_x is not None:
                     _dx = _aim_x - bd['x']; _dy = _aim_y - bd['y']
                     _dd = max(1.0, math.hypot(_dx, _dy))
@@ -725,32 +801,43 @@ def parkour_stage(which_map="old"):
         if rockets:
             new_rockets = []
             for rk in rockets:
-                rk['life'] -= 1
-                if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-                    _rang = math.atan2(rk['vy'], rk['vx']) - C.ROCKET_MANUAL_TURN
-                    _rspd = math.hypot(rk['vx'], rk['vy']) or C.ROCKET_SPEED
-                    rk['vx'], rk['vy'] = math.cos(_rang) * _rspd, math.sin(_rang) * _rspd
-                elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-                    _rang = math.atan2(rk['vy'], rk['vx']) + C.ROCKET_MANUAL_TURN
-                    _rspd = math.hypot(rk['vx'], rk['vy']) or C.ROCKET_SPEED
-                    rk['vx'], rk['vy'] = math.cos(_rang) * _rspd, math.sin(_rang) * _rspd
+                _rk_expired = False
+                if rk['kind'] == 'manual':
+                    # Self-destruct rocket: A/D steer it (mandatory — it never
+                    # auto-aims), and it blows itself up after 20s in the air.
+                    if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+                        _rang = math.atan2(rk['vy'], rk['vx']) - C.ROCKET_MANUAL_TURN
+                        _rspd = math.hypot(rk['vx'], rk['vy']) or C.ROCKET_SPEED
+                        rk['vx'], rk['vy'] = math.cos(_rang) * _rspd, math.sin(_rang) * _rspd
+                    elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+                        _rang = math.atan2(rk['vy'], rk['vx']) + C.ROCKET_MANUAL_TURN
+                        _rspd = math.hypot(rk['vx'], rk['vy']) or C.ROCKET_SPEED
+                        rk['vx'], rk['vy'] = math.cos(_rang) * _rspd, math.sin(_rang) * _rspd
+                    if pygame.time.get_ticks() - rk['born'] >= 20000:
+                        _rk_expired = True
                 else:
+                    # Homing rocket: auto-aims at the nearest enemy, but only
+                    # while it has a clear line of sight to it — otherwise it
+                    # just keeps flying straight until it does.
+                    rk['life'] -= 1
                     _rtargets = list(turrets) + list(siths)
                     if _rtargets:
                         _rt = min(_rtargets, key=lambda en: math.hypot(
                             en.rect.centerx - rk['x'], en.rect.centery - rk['y']))
-                        _rdx = _rt.rect.centerx - rk['x']; _rdy = _rt.rect.centery - rk['y']
-                        _rdd = max(1.0, math.hypot(_rdx, _rdy))
-                        _rux, _ruy = _rdx / _rdd, _rdy / _rdd
-                        rk['vx'] += (_rux * C.ROCKET_SPEED - rk['vx']) * C.ROCKET_TURN_RATE
-                        rk['vy'] += (_ruy * C.ROCKET_SPEED - rk['vy']) * C.ROCKET_TURN_RATE
+                        if has_line_of_sight(rk['x'], rk['y'], _rt.rect.centerx, _rt.rect.centery, ROWS, COLS, get_tile):
+                            _rdx = _rt.rect.centerx - rk['x']; _rdy = _rt.rect.centery - rk['y']
+                            _rdd = max(1.0, math.hypot(_rdx, _rdy))
+                            _rux, _ruy = _rdx / _rdd, _rdy / _rdd
+                            rk['vx'] += (_rux * C.ROCKET_SPEED - rk['vx']) * C.ROCKET_TURN_RATE
+                            rk['vy'] += (_ruy * C.ROCKET_SPEED - rk['vy']) * C.ROCKET_TURN_RATE
+                    _rk_expired = rk['life'] <= 0
                 rk['x'] += rk['vx'] * ts; rk['y'] += rk['vy'] * ts
                 _rzr, _rzc = int(rk['y']) // C.TILE, int(rk['x']) // C.TILE
                 _rhit_wall = 0 <= _rzr < ROWS and 0 <= _rzc < COLS and get_tile(_rzr, _rzc) == 'X'
                 _rrect = pygame.Rect(int(rk['x']) - 4, int(rk['y']) - 4, 8, 8)
                 _rhit_enemy = (any(t.rect.colliderect(_rrect) for t in turrets)
                                or any(s.rect.colliderect(_rrect) for s in siths))
-                if _rhit_wall or _rhit_enemy or rk['life'] <= 0:
+                if _rhit_wall or _rhit_enemy or _rk_expired:
                     do_explode(rk['x'], rk['y'], radius=C.ROCKET_EXP_RADIUS)
                 else:
                     new_rockets.append(rk)
@@ -815,19 +902,34 @@ def parkour_stage(which_map="old"):
                     _request_restart_flag[0] = True; _death_pending_flag[0] = True
                     nuke_state = None
 
-        camx, camy = center_camera_on_player(camx, camy, player, ROWS, COLS)
-
-        _SCOPE_MAX = float(C.TILE * SCOPE_RANGE_TILES.get(gun_type, 0))
-        if sniper_scoping and gun_type in SCOPE_RANGE_TILES:
-            _scope_dist = min(_scope_dist + dt * 0.22, _SCOPE_MAX)
+        # The homing rocket sends back its own view — the camera rides with
+        # it while it's in flight. (The self-destruct one stays third-person;
+        # you're steering it with A/D, not watching through it.) Re-checked
+        # fresh here rather than trusting an earlier flag, since the
+        # rocket-update block above can explode and remove it this same frame.
+        _pilot_rk = next((rk for rk in rockets if rk['kind'] == 'homing'), None)
+        if _pilot_rk is not None:
+            camx = max(0, min(COLS * C.TILE - C.WIDTH,  _pilot_rk['x'] - C.WIDTH  / 2))
+            camy = max(0, min(ROWS * C.TILE - C.HEIGHT, _pilot_rk['y'] - C.HEIGHT / 2))
         else:
-            _scope_dist = max(0.0, _scope_dist - dt * 0.35)
-        if _scope_dist > 0 and gun_type in SCOPE_RANGE_TILES:
+            camx, camy = center_camera_on_player(camx, camy, player, ROWS, COLS)
+
+        # Sniper scope: zooms forward along the aim line while Z is held,
+        # but a wall blocks it — once the sight line hits one, it simply
+        # stops advancing there (it doesn't creep through or snap back).
+        if _scope_dist > 0 or (sniper_scoping and gun_type in SCOPE_RANGE_TILES):
             _smx, _smy = pygame.mouse.get_pos()
             _spx, _spy = float(player.rect.centerx), float(player.rect.centery)
             _sdx, _sdy = (_smx + camx) - _spx, (_smy + camy) - _spy
             _sd = max(1.0, math.hypot(_sdx, _sdy))
             _sux, _suy = _sdx / _sd, _sdy / _sd
+        if sniper_scoping and gun_type in SCOPE_RANGE_TILES:
+            _SCOPE_MAX  = float(C.TILE * SCOPE_RANGE_TILES[gun_type])
+            _wall_limit = raycast_wall_distance(_spx, _spy, _sux, _suy, _SCOPE_MAX, ROWS, COLS, get_tile)
+            _scope_dist = min(_scope_dist + dt * 0.22, _wall_limit)
+        else:
+            _scope_dist = max(0.0, _scope_dist - dt * 0.35)
+        if _scope_dist > 0 and gun_type in SCOPE_RANGE_TILES:
             _stx = _spx + _sux * _scope_dist - C.WIDTH  / 2
             _sty = _spy + _suy * _scope_dist - C.HEIGHT / 2
             camx += (_stx - camx) * 0.10
@@ -839,8 +941,6 @@ def parkour_stage(which_map="old"):
             gp.update(ROWS, COLS, get_tile)
 
         lmb, _, rmb = pygame.mouse.get_pressed(3)
-        _mg_phase_ms = (pygame.time.get_ticks() - mg_phase_start) % 7000  # 5s fire, 2s pause
-        _mg_locked   = gun_type == 'machinegun' and _mg_phase_ms >= 5000
 
         # Helper: get aim direction toward mouse (world coords)
         def _aim_dir():
@@ -850,13 +950,13 @@ def parkour_stage(which_map="old"):
             _d = max(1.0, math.hypot(_dx, _dy))
             return _pcx, _pcy, _dx / _d, _dy / _d
 
-        def _make_bolt(px, py, ux, uy, ox=0.0, oy=0.0):
-            gb = Bolt(px + ox, py + oy, ux * C.BOLT_SPEED, uy * C.BOLT_SPEED)
+        def _make_bolt(px, py, ux, uy, ox=0.0, oy=0.0, max_range_tiles=None):
+            gb = Bolt(px + ox, py + oy, ux * C.BOLT_SPEED, uy * C.BOLT_SPEED, max_range_tiles=max_range_tiles)
             gb.friendly = True
-            if gun_type == 'machinegun':
-                gb.mg_bolt = True
-            elif gun_type == 'dual':
+            if gun_type == 'dual':
                 gb.one_shot = True
+            elif gun_type == 'shotgun':
+                gb.multi_hit = True  # takes 3 pellet hits to down a turret
             elif gun_type == 'dualblaster':
                 if taser_mode: gb.tasing = True
             elif gun_type == 'sniper':
@@ -871,20 +971,20 @@ def parkour_stage(which_map="old"):
                 if taser_mode: gb.tasing = True
             return gb
 
-        if active_weapon == 'gun' and not _mg_locked:
+        if active_weapon == 'gun':
             _now_g = pygame.time.get_ticks()
             if gun_type == 'dual':
-                # Burst: shot 1 at 0ms, shot 2 at 150ms, ready again after 600ms
-                if _dg_burst == 0 and lmb and _now_g - _dg_burst_start >= 600:
+                # Fires fast (bang-bang-bang); every 4th shot is followed by
+                # a brief 0.5s rest before the next one — no HUD countdown
+                # is shown for this rest.
+                if lmb and _now_g >= _dual_rest_until and _now_g - last_gun_shot >= _gun_cooldown:
+                    last_gun_shot = _now_g
                     _px, _py, _ux, _uy = _aim_dir()
-                    bolts.append(_make_bolt(_px, _py, _ux, _uy))
-                    _dg_burst = 1; _dg_burst_start = _now_g
-                elif _dg_burst == 1 and _now_g - _dg_burst_start >= 150:
-                    _px, _py, _ux, _uy = _aim_dir()
-                    bolts.append(_make_bolt(_px, _py, _ux, _uy))
-                    _dg_burst = 2
-                elif _dg_burst == 2 and _now_g - _dg_burst_start >= 600:
-                    _dg_burst = 0
+                    bolts.append(_make_bolt(_px, _py, _ux, _uy, max_range_tiles=15))
+                    _dual_burst_count += 1
+                    if _dual_burst_count >= 4:
+                        _dual_burst_count = 0
+                        _dual_rest_until  = _now_g + 500
             elif lmb and _now_g - last_gun_shot >= _gun_cooldown:
                 last_gun_shot = _now_g
                 _px, _py, _ux, _uy = _aim_dir()
@@ -893,6 +993,21 @@ def parkour_stage(which_map="old"):
                     _perp_x, _perp_y = -_uy * 5, _ux * 5
                     bolts.append(_make_bolt(_px, _py, _ux, _uy,  _perp_x,  _perp_y))
                     bolts.append(_make_bolt(_px, _py, _ux, _uy, -_perp_x, -_perp_y))
+                elif gun_type == 'sniper':
+                    # Both shots of the volley fire together — no gap
+                    # between them — then the full cooldown rests before
+                    # the next volley.
+                    _perp_x, _perp_y = -_uy * 3, _ux * 3
+                    bolts.append(_make_bolt(_px, _py, _ux, _uy,  _perp_x,  _perp_y))
+                    bolts.append(_make_bolt(_px, _py, _ux, _uy, -_perp_x, -_perp_y))
+                elif gun_type == 'shotgun':
+                    # 5-pellet close-range spread; each pellet fizzles out
+                    # after 10 tiles instead of flying the length of the level.
+                    for _ang in (-16, -8, 0, 8, 16):
+                        _rad = math.radians(_ang)
+                        _rux = _ux * math.cos(_rad) - _uy * math.sin(_rad)
+                        _ruy = _ux * math.sin(_rad) + _uy * math.cos(_rad)
+                        bolts.append(_make_bolt(_px, _py, _rux, _ruy, max_range_tiles=10))
                 else:
                     bolts.append(_make_bolt(_px, _py, _ux, _uy))
         thresh_sq   = (C.SABER_THICKNESS / 2 + 4) ** 2
@@ -956,11 +1071,11 @@ def parkour_stage(which_map="old"):
                         t.stun_until = _now_col + 30000
                         b.hit_ids.add(id(t))
                         if not b.enemy_penetrating: b.alive = False
-                    elif b.mg_bolt:
-                        t.mg_hits += 1
+                    elif b.multi_hit:
+                        t.hit_count += 1
                         b.hit_ids.add(id(t))
                         if not b.enemy_penetrating: b.alive = False
-                        if t.mg_hits >= 3:
+                        if t.hit_count >= 3:
                             if (not t.falling) and 0 <= t.r < ROWS and 0 <= t.c < COLS and get_tile(t.r, t.c) == '^':
                                 set_tile(t.r, t.c, '.')
                             gun_pickups.append(GunPickup(t.rect.centerx, t.rect.bottom))
@@ -1317,8 +1432,8 @@ def parkour_stage(which_map="old"):
             pygame.draw.rect(display.screen, (160, 220, 180), (_hb_x, _hb_y, _hb_w, _hb_h), 1, border_radius=5)
             _hval_lbl = display.FONT.render(f"HEALTH  {int(player.health)}", True, (220, 255, 230))
             display.screen.blit(_hval_lbl, (C.WIDTH // 2 - _hval_lbl.get_width() // 2, _hb_y + _hb_h // 2 - _hval_lbl.get_height() // 2))
-        # Jetpack fuel bar (Mandalorian, or anyone who bought one)
-        if _has_jetpack:
+        # Flamethrower fuel bar (Mandalorian only — the jetpack itself is unlimited)
+        if _has_flamethrower:
             _jb_w, _jb_h = 130, 10
             _jb_x, _jb_y = 10, 72
             _jb_fill = int(_jb_w * jetpack_fuel / JETPACK_FUEL_MAX)
@@ -1335,7 +1450,7 @@ def parkour_stage(which_map="old"):
         display.screen.blit(display.FONT.render(f"[2] GRENADE x{grenade_count}", True, gren_c), (110, 70))
         if gun_count >= 1:
             gun_c = C.WHITE if active_weapon == 'gun' else (80, 80, 90)
-            _gun_lbl = {'dual': 'DOUBLE', 'machinegun': 'MG', 'dualblaster': 'DUAL',
+            _gun_lbl = {'dual': 'DOUBLE', 'shotgun': 'SHOTGUN', 'blaster': 'BLASTER', 'dualblaster': 'DUAL',
                          'sniper': 'SNIPER', 'raygun': 'RAY', 'penetrator': 'PENETR'}.get(gun_type, 'GUN')
             display.screen.blit(display.FONT.render(f"[3] {_gun_lbl}", True, gun_c), (280, 70))
         elif gun_pickups:
@@ -1346,14 +1461,6 @@ def parkour_stage(which_map="old"):
             if gun_type in ('dualblaster', 'raygun', 'penetrator'):
                 _tsz_col = (80, 255, 180) if taser_mode else (60, 80, 70)
                 display.screen.blit(display.FONT.render("S=TASER [ON]" if taser_mode else "S=TASER", True, _tsz_col), (490, 70))
-            if gun_type == 'machinegun':
-                _mg_p = (pygame.time.get_ticks() - mg_phase_start) % 7000
-                if _mg_p >= 5000:
-                    _mg_remain = (2000 - (_mg_p - 5000)) / 1000.0
-                    display.screen.blit(display.FONT.render(f"RELOAD {_mg_remain:.1f}s", True, (255, 80, 80)), (490, 70))
-                else:
-                    _mg_remain = (5000 - _mg_p) / 1000.0
-                    display.screen.blit(display.FONT.render(f"FIRE  {_mg_remain:.1f}s", True, (80, 200, 80)), (490, 70))
             if gun_type in SCOPE_RANGE_TILES and sniper_scoping:
                 display.screen.blit(display.FONT.render("[ SCOPE ]", True, (180, 220, 255)), (650, 70))
         if character == 'jedi':
@@ -1366,13 +1473,17 @@ def parkour_stage(which_map="old"):
             _hint = "A/D move  W jump  LMB shoot  S=taser  Z=scope  4=grapple then click  ESC colours  Bksp restart"
         else:
             _hint = "A/D move  W jump  LMB shoot  S=taser  4=grapple then click  ESC colours  Bksp restart"
-        if _has_jetpack and character != 'mandalorian':
-            _hint += "  Space=jetpack"
+        if character == 'trooper' and len(progress['owned_guns']) > 1:
+            _hint += "  3=switch gun"
+        if _has_jetpack:
+            _hint += "  E=jetpack"
         if progress['barrier_bought']:
             _hint += "  C=shield"
         if character == 'mandalorian' and progress['bird_ammo'] > 0:
             _hint += f"  B=bird x{progress['bird_ammo']}"
-        if character == 'mandalorian' and progress['rocket_ammo'] > 0:
-            _hint += f"  N=rocket x{progress['rocket_ammo']}"
+        if character == 'mandalorian' and progress['rocket_ammo_manual'] > 0:
+            _hint += f"  N=self-destruct rocket x{progress['rocket_ammo_manual']}"
+        if character == 'mandalorian' and progress['rocket_ammo_homing'] > 0:
+            _hint += f"  H=homing rocket x{progress['rocket_ammo_homing']}"
         display.screen.blit(display.FONT.render(_hint, True, C.YELLOW), (10, C.HEIGHT - 28))
         pygame.display.flip()
